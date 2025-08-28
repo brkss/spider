@@ -32,6 +32,41 @@
 //#define ST7735_TAB INITR_GREENTAB
 //#define ST7735_TAB INITR_REDTAB
 
+enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_COUNT };
+struct Params {
+  int volumePercent; // 0..100
+  int tempoBPM;      // 30..240 (clamped)
+};
+
+// Sine/Triangle blend oscillator
+struct Osc {
+  float phase = 0.0f;
+  float freqHz = 0.0f;
+  float triMix = 0.30f; // 0..1: 0=sine, 1=triangle
+};
+
+// One-pole low-pass: y += a*(x - y), a from cutoff
+struct OnePoleLP {
+  float a = 0.0f;
+  float y = 0.0f;
+};
+
+// Gentle pad: 3 detuned osc → amp-LFO → LPF
+struct Pad {
+  Osc v1, v2, v3;
+  float baseHz = 160.0f;
+  float det = 0.012f;        // ±1.2%
+  float triMix = 0.30f;      // sine/triangle blend
+  // Amp LFO
+  float ampLfoPhase = 0.0f;
+  float ampLfoRateHz = 0.08f;
+  float ampLfoDepth = 0.25f; // 0..1
+  // LPF
+  OnePoleLP lp;
+  float lpfCutHz = 1800.0f;
+  bool inited = false;
+};
+
 // -------- Audio constants --------
 static const int   SR   = 44100;
 static const float TAU  = 6.28318530718f;
@@ -43,6 +78,17 @@ static const int   DMA_CNT = 8;
 SPIClass vspi(VSPI);
 Adafruit_ST7735 tft(&vspi, TFT_CS, TFT_DC, TFT_RST);
 
+// --- Globals for Page/UI/Button ---
+static Page currentPage = PAGE_VOLUME;
+static Params params = { 70, 100 };      // defaults
+static volatile bool btnRaw = false;     // set in ISR
+static unsigned long btnLastMs = 0;      // debounce
+static int lastPageShown = -1;           // UI cache
+static int lastValShown  = -1;
+
+// --- [NEW] Button ISR & Debounce ---
+void IRAM_ATTR onEncButton() { btnRaw = true; }
+
 // -------- Encoder state --------
 static volatile int32_t encDelta = 0;
 static uint8_t encPrev = 0;
@@ -53,6 +99,35 @@ static const int8_t ENC_TAB[16] = {
   0,  1, -1, 0
 };
 
+
+// call in loop; returns true once per valid click
+bool consumeButtonClick() {
+  if (!btnRaw) return false;
+  btnRaw = false;
+  unsigned long now = millis();
+  if (now - btnLastMs < 180) return false; // debounce
+  btnLastMs = now;
+  return true;
+}
+
+inline const char* pageName(Page p){
+  switch(p){
+    case PAGE_VOLUME: return "Volume";
+    case PAGE_TEMPO:  return "Tempo";
+    default:          return "?";
+  }
+}
+
+void nextPage(){
+  currentPage = (Page)((currentPage + 1) % PAGE_COUNT);
+  lastPageShown = -1; // force UI refresh
+  lastValShown  = -1;
+}
+
+// --- [NEW] Helpers: clamping & page cycling ---
+inline int clampVolume(int v){ if(v<0) return 0; if(v>100) return 100; return v; }
+inline int clampTempo (int b){ if(b<30) return 30; if(b>240) return 240; return b; }
+
 inline void readEncoderStep() {
   uint8_t a = digitalRead(ENC_A);
   uint8_t b = digitalRead(ENC_B);
@@ -61,6 +136,8 @@ inline void readEncoderStep() {
   encDelta += ENC_TAB[idx];
   encPrev = cur;
 }
+
+
 inline int32_t takeEncoderDelta() {
   noInterrupts();
   int32_t d = encDelta;
@@ -68,6 +145,8 @@ inline int32_t takeEncoderDelta() {
   interrupts();
   return d;
 }
+
+
 
 // -------- DC Blocker --------
 struct DCBlock {
@@ -81,37 +160,64 @@ struct DCBlock {
 };
 
 // -------- Pad (3 detuned sines + gentle shimmer) --------
-struct Pad {
-  float p1=0, p2=0, p3=0;
-  float lfoA=0, lfoB=0;
-  inline float step() {
-    const float base = 140.0f;     // slightly lower for small speaker
-    const float det  = 0.011f;     // ±1.1%
-    const float vibDepth = 0.22f;  // Hz
-    const float vibRate  = 0.18f;  // Hz
-    const float ampRate  = 0.07f;  // Hz
+// --- [REPLACED] Oscillator, LPF helpers, and Pad synth ---
 
-    lfoA += TAU * (vibRate / SR); if (lfoA >= TAU) lfoA -= TAU;
-    lfoB += TAU * (ampRate / SR); if (lfoB >= TAU) lfoB -= TAU;
 
-    float vib = vibDepth * sinf(lfoA);
-    float amp = 0.72f + 0.25f * (0.5f + 0.5f * sinf(lfoB)); // 0.72..0.97
 
-    float f1 = base + vib;
-    float f2 = base * (1.0f + det) + vib;
-    float f3 = base * (1.0f - det) + vib;
+inline float osc_sine_tri(Osc& o, float sr) {
+  // advance
+  o.phase += (TAU * (o.freqHz / sr));
+  if (o.phase >= TAU) o.phase -= TAU;
 
-    p1 += TAU * (f1 / SR); if (p1 >= TAU) p1 -= TAU;
-    p2 += TAU * (f2 / SR); if (p2 >= TAU) p2 -= TAU;
-    p3 += TAU * (f3 / SR); if (p3 >= TAU) p3 -= TAU;
+  // components
+  float s = sinf(o.phase);
 
-    float s = (sinf(p1) + sinf(p2) + sinf(p3)) * (1.0f/3.0f);
-    // low-level 2nd harmonic for body
-    s = 0.88f * s + 0.12f * sinf(2.0f * p1);
-    return s * amp;
-  }
-};
+  float u = o.phase / TAU;              // 0..1
+  u = u - floorf(u);
+  float tri = 4.0f * fabsf(u - 0.5f) - 1.0f; // -1..1
 
+  float mix = o.triMix;
+  return (1.0f - mix) * s + mix * tri;
+}
+
+
+
+inline void lp_set(OnePoleLP& f, float cutoffHz, float sr) {
+  f.a = 1.0f - expf(-(TAU * cutoffHz) / sr);
+}
+inline float lp_process(OnePoleLP& f, float x) {
+  f.y += f.a * (x - f.y);
+  return f.y;
+}
+
+
+
+inline void pad_init(Pad& p, float sr) {
+  p.v1.freqHz = p.baseHz;
+  p.v2.freqHz = p.baseHz * (1.0f + p.det);
+  p.v3.freqHz = p.baseHz * (1.0f - p.det);
+  p.v1.triMix = p.v2.triMix = p.v3.triMix = p.triMix;
+  lp_set(p.lp, p.lpfCutHz, sr);
+  p.inited = true;
+}
+
+inline float pad_step(Pad& p, float sr) {
+  if (!p.inited) pad_init(p, sr);
+
+  // slow amp LFO
+  p.ampLfoPhase += TAU * (p.ampLfoRateHz / sr);
+  if (p.ampLfoPhase >= TAU) p.ampLfoPhase -= TAU;
+  float lfo = 0.5f + 0.5f * sinf(p.ampLfoPhase);                 // 0..1
+  float amp = (1.0f - p.ampLfoDepth) + p.ampLfoDepth * lfo;      // 1-depth .. 1
+
+  // 3-voice detuned pad
+  float s = (osc_sine_tri(p.v1, sr) + osc_sine_tri(p.v2, sr) + osc_sine_tri(p.v3, sr)) * (1.0f / 3.0f);
+  s *= amp;
+
+  // gentle LPF
+  s = lp_process(p.lp, s);
+  return s;
+}
 // -------- Soft clip (tanh-ish) --------
 inline float softClip(float x) {
   const float drive = 1.2f; // a touch more output
@@ -154,6 +260,43 @@ void tftShowVolume(int vol) {
   tft.print(line);
 }
 
+// --- Apply encoder rotation to active page ---
+void applyEncoderDelta(int steps){
+  if (steps == 0) return;
+  int delta = (steps > 0) ? 1 : -1;   // compress chatter
+  if (currentPage == PAGE_VOLUME) {
+    params.volumePercent = clampVolume(params.volumePercent + delta);
+    // route to existing volume smoothing path
+    volTarget = (float)params.volumePercent;
+  } else { // PAGE_TEMPO
+    params.tempoBPM = clampTempo(params.tempoBPM + delta);
+  }
+}
+
+
+// --- UI draw for flat pages ---
+void uiMaybeRedraw(){
+  int shownVal = (currentPage == PAGE_VOLUME) ? params.volumePercent : params.tempoBPM;
+  if (lastPageShown == (int)currentPage && lastValShown == shownVal) return;
+
+  char line[32];
+  snprintf(line, sizeof(line), "PAGE: %s VAL: %d", pageName(currentPage), shownVal);
+
+  tft.setTextSize(2);
+  int16_t x1, y1; uint16_t w, h;
+  tft.getTextBounds(line, 0, 0, &x1, &y1, &w, &h);
+  int x = (tft.width()  - (int)w) / 2;
+  int y = (tft.height() - (int)h) / 2;
+
+  tft.fillRect(x - 6, y - 6, w + 12, h + 12, ST77XX_BLACK);
+  tft.setCursor(x, y);
+  tft.print(line);
+
+  lastPageShown = (int)currentPage;
+  lastValShown  = shownVal;
+}
+
+
 // -------- I2S --------
 void i2sInit() {
   i2s_config_t cfg = {};
@@ -190,6 +333,12 @@ void setup() {
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(ENC_B, INPUT_PULLUP);
   pinMode(ENC_SW, INPUT_PULLUP);
+  attachInterrupt(digitalPinToInterrupt(ENC_SW), onEncButton, FALLING);
+  currentPage = PAGE_VOLUME;
+  params.volumePercent = 70;  // matches your default
+  params.tempoBPM = 100;
+  volTarget = (float)params.volumePercent; // ensure audio path sees it
+  lastPageShown = -1; lastValShown = -1;   // force first draw
   encPrev = (digitalRead(ENC_A) << 1) | digitalRead(ENC_B);
 
   // TFT
@@ -208,18 +357,18 @@ inline void updateVolumeSmoothing() {
   volSmooth += alpha * (target - volSmooth);
 }
 
+
 // -------- Main Loop --------
 void loop() {
   // --- Encoder/UI ---
   readEncoderStep();
   int32_t steps = takeEncoderDelta();
-  if (steps != 0) {
-    // Compress chatter: roughly 2 "logical" steps per detent
-    int delta = (steps > 0) ? 1 : -1;
-    volTarget += delta;
-    if (volTarget < 0)   volTarget = 0;
-    if (volTarget > 100) volTarget = 100;
+  applyEncoderDelta(steps);
+
+  if (consumeButtonClick()) {
+    nextPage();
   }
+  uiMaybeRedraw();
   tftShowVolume((int)volTarget);
 
   // --- Audio: render & push one CHUNK ---
@@ -227,10 +376,12 @@ void loop() {
   if (fade < 1.0f) { fade += (float)CHUNK / (SR * 0.8f); if (fade > 1.0f) fade = 1.0f; }
 
   for (int i = 0; i < CHUNK; ++i) {
-    float s = pad.step();                  // raw pad
-    float x = s * volSmooth * fade;        // gain + fade
-    x = dc.process(x);                     // DC block
-    x = softClip(x);                       // clip
+    float s = pad_step(pad, SR);          // <— new gentle pad source
+
+    float x = s * volSmooth * fade;       // gain + fade
+    x = dc.process(x);                    // DC block
+    x = softClip(x);                      // soft clip
+
     int16_t v = (int16_t)floorf(x * 32767.0f);
     int j = i * 2;
     buf[j + 0] = v;  // L
