@@ -32,13 +32,19 @@
 //#define ST7735_TAB INITR_GREENTAB
 //#define ST7735_TAB INITR_REDTAB
 
+// --- [NEW] Master makeup gain to boost overall loudness ---
+static const float MASTER_GAIN = 1.35f;  // ~+2.6 dB headroom into soft clip
+
 enum DelayMode : uint8_t { DELAY_1_8 = 0, DELAY_1_4 };
 enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
-enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_COUNT };
+enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_MOOD, PAGE_TONE, PAGE_ENERGY, PAGE_COUNT };
 struct Params {
   int volumePercent; // 0..100
   int tempoBPM;      // 30..240 (clamped)
   int spacePercent;  // 0..100  (delay send/mix)
+  int moodPercent;   // 0..100
+  int tonePercent;   // 0..100
+  int energyPercent; // 0..100
 };
 
 // Sine/Triangle blend oscillator
@@ -102,6 +108,40 @@ struct Delay {
 };
 
 static Delay gDelay;
+
+// Tone / Mood 
+struct TiltEQ {
+  OnePoleLP split6k;
+  float gainLow = 1.0f, gainHigh = 1.0f;
+  bool inited = false;
+};
+static TiltEQ gTilt;
+
+// Explicit prototypes so Arduino's auto-prototyper doesn't mangle them
+static inline void  tone_init(TiltEQ& t);
+static inline void  tone_set(TiltEQ& t, int tonePct);
+static inline float tone_process(TiltEQ& t, float x);
+
+// Energy 
+// --- [NEW] Energy mapping state + prototypes (place near other types/globals) ---
+struct EnergyCtrl {
+  // note trigger probabilities (per 1/16)
+  float pStrong = 0.40f;
+  float pEven   = 0.22f;
+  float pOdd    = 0.08f;
+  // pad movement
+  float ampLfoRateHz = 0.08f;
+  float ampLfoDepth  = 0.25f;
+  // gesture Poisson
+  float    gestureLambdaHz = 1.0f / 12.0f; // avg 12s
+  uint64_t nextGestureAt   = 0;
+};
+static EnergyCtrl gEnergy;
+
+// Prototypes (Arduino auto-proto can miss these)
+static inline uint32_t samplesFromExp(float lambdaHz);
+static inline void     energy_set(EnergyCtrl& e, Pad& pad, int energyPct);
+static inline void     maybeTriggerGesture(EnergyCtrl& e, uint64_t smpNow);
 
 // --- [NEW] Light Reverb (4 combs + 2 allpasses) ---
 #define RV_COMB1 1117
@@ -179,6 +219,8 @@ static const ScaleDef SCALES[(int)SCALE_COUNT] = {
 
 inline const ScaleDef& scaleDef(Scale s) { return SCALES[(int)s]; }
 
+
+
 // -------- Audio constants --------
 static const int   SR   = 44100;
 static const float TAU  = 6.28318530718f;
@@ -227,6 +269,8 @@ inline const char* pageName(Page p){
     case PAGE_VOLUME: return "Volume";
     case PAGE_TEMPO:  return "Tempo";
     case PAGE_SPACE:  return "Space";
+    case PAGE_MOOD:   return "Mood";
+    case PAGE_TONE:   return "Tone";
     default:          return "?";
   }
 }
@@ -327,20 +371,16 @@ inline void clock_update_tempo_if_changed(Clock16& c, int bpm){
 
 // Called on every 1/16 step (no audible click; default no-op)
 inline void onStep16(uint16_t step){
-   // lazy init OK here
-  if (!gPluck.inited) pluck_init(gPluck);
+   if (!gPluck.inited) pluck_init(gPluck);
 
-  // Probability by grid strength
-  float p = 0.0f;
-  if ((step & 3u) == 0u)       p = 0.55f;   // strong beats (every 4th 1/16)
-  else if ((step & 1u) == 0u)  p = 0.28f;   // even 1/8 positions
-  else                         p = 0.10f;   // off 1/16s
+  float p = ((step & 3u) == 0u) ? gEnergy.pStrong
+           : ((step & 1u) == 0u) ? gEnergy.pEven
+           : gEnergy.pOdd;
 
   if (rand01() < p){
-    int center = 60; // C4 center (simple & musical)
-    // pick a nearby in-scale note
+    int center = 60; // C4 center
     int note = pickAmbientNote(gScale, center);
-    float vel = 0.55f + 0.35f * rand01(); // subtle velocity 0.55..0.90
+    float vel = 0.55f + 0.35f * rand01();
     pluck_noteOn(gPluck, note, vel);
   }
 }
@@ -543,6 +583,104 @@ inline float pad_step(Pad& p, float sr) {
   return s;
 }
 
+// --- [NEW] Tone EQ (tilt around ~6 kHz) ---
+
+
+inline void tone_init(TiltEQ& t){
+  lp_set(t.split6k, 6000.0f, SR); // split at ~6 kHz
+  t.gainLow = 1.0f; t.gainHigh = 1.0f;
+  t.inited = true;
+}
+
+// tonePercent 0..100 → tilt -3..+3 dB (complementary low/high)
+inline void tone_set(TiltEQ& t, int tonePct){
+  if (!t.inited) tone_init(t);
+  if (tonePct < 0) tonePct = 0; if (tonePct > 100) tonePct = 100;
+  float u = tonePct * (1.0f/100.0f);         // 0..1
+  float tiltDb = 6.0f*(u - 0.5f);            // -3..+3
+  float gH = powf(10.0f, tiltDb/20.0f);      // linear
+  float gL = 1.0f / gH;                      // complementary
+  // keep within safe bounds to avoid harshness
+  if (gH > 1.5f) gH = 1.5f; if (gH < 0.67f) gH = 0.67f;
+  if (gL > 1.5f) gL = 1.5f; if (gL < 0.67f) gL = 0.67f;
+  t.gainHigh = gH; t.gainLow = gL;
+}
+
+inline float tone_process(TiltEQ& t, float x){
+  if (!t.inited) tone_init(t);
+  float low = lp_process(t.split6k, x);
+  float high = x - low;
+  return t.gainLow*low + t.gainHigh*high;
+}
+
+// Energy 
+
+// --- [NEW] Energy mapping helpers ---
+inline uint32_t samplesFromExp(float lambdaHz){
+  if (lambdaHz <= 0.0f) lambdaHz = 1e-6f;
+  float r = 1.0f - rand01(); if (r < 1e-6f) r = 1e-6f;
+  float sec = -logf(r) / lambdaHz;
+  uint32_t s = (uint32_t)(sec * SR + 0.5f);
+  if (s < 1u) s = 1u;
+  return s;
+}
+
+inline void energy_set(EnergyCtrl& e, Pad& pad, int energyPct){
+  if (energyPct < 0) energyPct = 0; if (energyPct > 100) energyPct = 100;
+  float u  = energyPct * (1.0f/100.0f);
+  float u1 = sqrtf(u); // musical curve
+
+  // Scheduler probabilities (clamped)
+  e.pStrong = constrain(0.40f * (0.7f + 1.2f * u1), 0.10f, 0.85f);
+  e.pEven   = constrain(0.22f * (0.7f + 1.2f * u1), 0.05f, 0.55f);
+  e.pOdd    = constrain(0.08f * (0.7f + 1.2f * u1), 0.02f, 0.30f);
+
+  // Pad movement
+  e.ampLfoRateHz = 0.04f + (0.18f - 0.04f) * u1;  // 0.04..0.18 Hz
+  e.ampLfoDepth  = 0.15f + (0.32f - 0.15f) * u1;  // 0.15..0.32
+  pad.ampLfoRateHz = e.ampLfoRateHz;
+  pad.ampLfoDepth  = e.ampLfoDepth;
+
+  // Gesture Poisson rate (≈ every 30s → 6s)
+  e.gestureLambdaHz = (1.0f/30.0f) + ((1.0f/6.0f) - (1.0f/30.0f)) * u1;
+  // Initialize next event if not scheduled yet
+  if (e.nextGestureAt == 0) {
+    // gClock may not be visible here; will init on first maybeTriggerGesture() call
+  }
+}
+
+inline void maybeTriggerGesture(EnergyCtrl& e, uint64_t smpNow){
+  if (e.nextGestureAt == 0) {
+    e.nextGestureAt = smpNow + samplesFromExp(e.gestureLambdaHz);
+    return;
+  }
+  if (smpNow >= e.nextGestureAt){
+    // (stub) future: brief brighten/swell gesture tied to pad/FX
+    e.nextGestureAt = smpNow + samplesFromExp(e.gestureLambdaHz);
+  }
+}
+
+// MOOD 
+inline void mood_set(Pad& pad, ReverbLite& rv, int moodPct){
+  if (moodPct < 0) moodPct = 0; if (moodPct > 100) moodPct = 100;
+  float k = moodPct * (1.0f/100.0f);   // 0..1
+
+  // LPF cutoff: log map 400 → 8000 Hz
+  float cut = 400.0f * powf(20.0f, k); // 400 * 20^k
+  pad.lpfCutHz = cut;
+  lp_set(pad.lp, pad.lpfCutHz, SR);
+
+  // Osc shape: sine→triangle blend (gentle range)
+  pad.triMix = 0.10f + 0.60f * k;      // 0.10 .. 0.70
+  pad.v1.triMix = pad.v2.triMix = pad.v3.triMix = pad.triMix;
+
+  // Reverb damping: darker (more damp) at low mood → airier at high mood
+  float moodDamp = 0.35f - 0.20f * k;  // 0.35 .. 0.15
+  // Combine with current Space-based damp (average to avoid jumps)
+  for (int i=0;i<4;i++){
+    rv.c[i].damp = 0.5f * rv.c[i].damp + 0.5f * moodDamp;
+  }
+}
 
 // REVERB 
 inline void reverb_init(ReverbLite& r){
@@ -682,7 +820,7 @@ inline float delay_step(Delay& dl, float dry){
 }
 // -------- Soft clip (tanh-ish) --------
 inline float softClip(float x) {
-  const float drive = 1.2f; // a touch more output
+  const float drive = 1.8f; // a touch more output
   return tanhf(drive * x);
 }
 
@@ -725,47 +863,52 @@ void tftShowVolume(int vol) {
 // --- Apply encoder rotation to active page ---
 void applyEncoderDelta(int steps){
   if (steps == 0) return;
-  int delta = (steps > 0) ? 1 : -1;   // compress chatter
+  int delta = (steps > 0) ? 1 : -1;
+
   if (currentPage == PAGE_VOLUME) {
     params.volumePercent = clampVolume(params.volumePercent + delta);
-    // route to existing volume smoothing path
     volTarget = (float)params.volumePercent;
-  }  else if (currentPage == PAGE_TEMPO) { // PAGE_TEMPO
+  } else if (currentPage == PAGE_TEMPO) {
     params.tempoBPM = clampTempo(params.tempoBPM + delta);
-  } else { // PAGE_SPACE
-    params.spacePercent += delta;
-    if (params.spacePercent < 0) params.spacePercent = 0;
-    if (params.spacePercent > 100) params.spacePercent = 100;
-    // reflect mapping immediately
+  } else if (currentPage == PAGE_SPACE) {
+    params.spacePercent = constrain(params.spacePercent + delta, 0, 100);
     delay_set_space(gDelay, params.spacePercent);
+  } else if (currentPage == PAGE_MOOD) {
+    params.moodPercent = constrain(params.moodPercent + delta, 0, 100);
+    mood_set(pad, gReverb, params.moodPercent);
+  } else if (currentPage == PAGE_TONE) {
+    params.tonePercent = constrain(params.tonePercent + delta, 0, 100);
+    tone_set(gTilt, params.tonePercent);
+  } else { // PAGE_ENERGY
+    params.energyPercent = constrain(params.energyPercent + delta, 0, 100);
+    energy_set(gEnergy, pad, params.energyPercent);
   }
 }
 
 
 // --- UI draw for flat pages ---
 void uiMaybeRedraw(){
-  int shownVal = (currentPage == PAGE_VOLUME) ? params.volumePercent
-                : (currentPage == PAGE_TEMPO) ? params.tempoBPM
-                : params.spacePercent; // PAGE_SPACE
-  if (lastPageShown == (int)currentPage && lastValShown == shownVal) return;
+  int shownVal =
+    (currentPage == PAGE_VOLUME) ? params.volumePercent :
+    (currentPage == PAGE_TEMPO)  ? params.tempoBPM :
+    (currentPage == PAGE_SPACE)  ? params.spacePercent :
+    (currentPage == PAGE_MOOD)   ? params.moodPercent :
+                                   params.tonePercent; // PAGE_TONE
 
+  if (lastPageShown == (int)currentPage && lastValShown == shownVal) return;
   char line[32];
   snprintf(line, sizeof(line), "PAGE: %s VAL: %d", pageName(currentPage), shownVal);
-
   tft.setTextSize(2);
   int16_t x1, y1; uint16_t w, h;
   tft.getTextBounds(line, 0, 0, &x1, &y1, &w, &h);
   int x = (tft.width()  - (int)w) / 2;
   int y = (tft.height() - (int)h) / 2;
-
   tft.fillRect(x - 6, y - 6, w + 12, h + 12, ST77XX_BLACK);
   tft.setCursor(x, y);
   tft.print(line);
-
   lastPageShown = (int)currentPage;
   lastValShown  = shownVal;
 }
-
 
 // -------- I2S --------
 void i2sInit() {
@@ -824,6 +967,17 @@ void setup() {
   delay_init(gDelay, params.tempoBPM, DELAY_1_4, 2800.0f);  // darker tone, longer tap
   delay_set_space(gDelay, params.spacePercent);
 
+  // mood / tone init 
+  params.moodPercent = 50;
+  params.tonePercent = 50;
+  tone_init(gTilt);
+  mood_set(pad, gReverb, params.moodPercent);
+  tone_set(gTilt, params.tonePercent);
+
+  // energy 
+  params.energyPercent = 50;
+  energy_set(gEnergy, pad, params.energyPercent);
+
   // I2S
   i2sInit();
 }
@@ -857,16 +1011,17 @@ void loop() {
   clock_update_tempo_if_changed(gClock, params.tempoBPM);
   delay_update_tempo_if_changed(gDelay, params.tempoBPM);
 
-
+  // mixer blaah
   for (int i = 0; i < CHUNK; ++i) {
-    float dry = /*pad_step(pad, SR) +*/ pluck_step(gPluck, SR);
+    float dry0 = /*pad_step(pad, SR) +*/ pluck_step(gPluck, SR);
+    float dry  = tone_process(gTilt, dry0);      // <— tilt EQ
 
-    float wetTap  = delay_step(gDelay,  dry);     // tempo-aware delay
-    float wetRev  = reverb_step(gReverb, dry);    // light reverb
+    float wetTap = delay_step(gDelay, dry);
+    float wetRev = reverb_step(gReverb, dry);
 
     float s = dry + gDelay.wet * wetTap + gReverb.wet * wetRev;
 
-    float x = s * volSmooth * fade;
+    float x = s * volSmooth * fade * MASTER_GAIN;
     x = dc.process(x);
     x = softClip(x);
 
@@ -879,4 +1034,5 @@ void loop() {
   size_t written = 0;
   i2s_write(I2S_NUM_0, (const char*)buf, sizeof(buf), &written, portMAX_DELAY);
   clock_advance_block(gClock, (uint32_t)CHUNK);
+  maybeTriggerGesture(gEnergy, gClock.smpNow);
 }
