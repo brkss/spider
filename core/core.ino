@@ -32,10 +32,13 @@
 //#define ST7735_TAB INITR_GREENTAB
 //#define ST7735_TAB INITR_REDTAB
 
-enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_COUNT };
+enum DelayMode : uint8_t { DELAY_1_8 = 0, DELAY_1_4 };
+enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
+enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_COUNT };
 struct Params {
   int volumePercent; // 0..100
   int tempoBPM;      // 30..240 (clamped)
+  int spacePercent;  // 0..100  (delay send/mix)
 };
 
 // Sine/Triangle blend oscillator
@@ -78,9 +81,58 @@ struct Clock16 {
 
 static Clock16 gClock;
 
-// --- [NEW] Scales: enums, defs, and table ---
-enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
 
+#if defined(DELAY_MAX_SAMPLES)
+  #undef DELAY_MAX_SAMPLES
+#endif
+#define DELAY_MAX_SAMPLES 32768  // ~0.74s @ 44.1k (1/4 note ≥ ~81 BPM), ≈64 KB
+
+struct Delay {
+  int16_t buf[DELAY_MAX_SAMPLES]; // mono ring buffer, no malloc
+  uint32_t size = DELAY_MAX_SAMPLES;
+  uint32_t w = 0;                 // write index
+  uint32_t dSamp = 22050;         // delay time in samples
+  OnePoleLP tone;                 // LP in feedback path
+  float send = 0.0f;              // dry → delay input
+  float wet  = 0.0f;              // wet tap mix
+  float fb   = 0.0f;              // feedback amount
+  uint16_t bpmCached = 104;
+  DelayMode mode = DELAY_1_8;
+  bool inited = false;
+};
+
+static Delay gDelay;
+
+// --- [NEW] Lightweight Pluck: voice/pool & tiny RNG (place with other types/globals) ---
+enum EnvState : uint8_t { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
+
+struct ADSR {
+  float a=0.008f, d=0.22f, s=0.20f, r=0.14f; // soft pluck
+  float env=0.0f;
+  EnvState st=ENV_IDLE;
+  bool gate=false;
+};
+
+struct PluckVoice {
+  bool  active=false;
+  int   midi=60;
+  float freqHz=261.63f;
+  float phase=0.0f;
+  float vel=0.7f;     // 0..1 subtle
+  ADSR  eg;
+};
+
+struct PluckPool {
+  PluckVoice v[4];
+  float gain=0.35f;   // headroom vs pad
+  bool  inited=false;
+};
+
+static PluckPool gPluck;
+static Scale gScale = SCALE_A_MINOR;      // use your quantizer scales
+static uint32_t gRng32 = 0xA3C59AC3u;     // tiny xorshift RNG state
+
+// --- [NEW] Scales: enums, defs, and table ---
 struct ScaleDef {
   uint8_t rootPC;        // 0..11 (C=0, C#=1, ... A=9, B=11)
   uint8_t degrees[7];    // diatonic degrees as pitch-class offsets from root
@@ -142,6 +194,7 @@ inline const char* pageName(Page p){
   switch(p){
     case PAGE_VOLUME: return "Volume";
     case PAGE_TEMPO:  return "Tempo";
+    case PAGE_SPACE:  return "Space";
     default:          return "?";
   }
 }
@@ -242,7 +295,22 @@ inline void clock_update_tempo_if_changed(Clock16& c, int bpm){
 
 // Called on every 1/16 step (no audible click; default no-op)
 inline void onStep16(uint16_t step){
-  (void)step; // placeholder for future actions
+   // lazy init OK here
+  if (!gPluck.inited) pluck_init(gPluck);
+
+  // Probability by grid strength
+  float p = 0.0f;
+  if ((step & 3u) == 0u)       p = 0.55f;   // strong beats (every 4th 1/16)
+  else if ((step & 1u) == 0u)  p = 0.28f;   // even 1/8 positions
+  else                         p = 0.10f;   // off 1/16s
+
+  if (rand01() < p){
+    int center = 60; // C4 center (simple & musical)
+    // pick a nearby in-scale note
+    int note = pickAmbientNote(gScale, center);
+    float vel = 0.55f + 0.35f * rand01(); // subtle velocity 0.55..0.90
+    pluck_noteOn(gPluck, note, vel);
+  }
 }
 
 inline void clock_advance_block(Clock16& c, uint32_t blockSamples){
@@ -331,6 +399,90 @@ inline int pickAmbientNote(Scale s, int centerMidi) {
   return out;
 }
 
+// --- [NEW] Pluck helpers: RNG, ADSR, noteOn, render ---
+inline uint32_t rng32(){ uint32_t x=gRng32; x^=x<<13; x^=x>>17; x^=x<<5; return gRng32=x; }
+inline float rand01(){ return (rng32() * (1.0f/4294967296.0f)); } // [0,1)
+
+inline float midiToHz(int m){ return 440.0f * powf(2.0f, (m - 69) * (1.0f/12.0f)); }
+
+inline float adsr_step(ADSR& e, float sr){
+  switch(e.st){
+    case ENV_ATTACK: {
+      float inc = (e.a <= 0.0f) ? 1.0f : 1.0f/(e.a*sr);
+      e.env += inc;
+      if (e.env >= 1.0f){ e.env = 1.0f; e.st = ENV_DECAY; }
+    } break;
+    case ENV_DECAY: {
+      float dec = (e.d <= 0.0f) ? 1.0f : 1.0f/(e.d*sr);
+      e.env -= dec*(1.0f - e.s);
+      if (e.env <= e.s){ e.env = e.s; e.st = ENV_SUSTAIN; }
+    } break;
+    case ENV_SUSTAIN:
+      // For pluck, immediately head to release if gate not held
+      if (!e.gate) e.st = ENV_RELEASE;
+      break;
+    case ENV_RELEASE: {
+      float dec = (e.r <= 0.0f) ? 1.0f : 1.0f/(e.r*sr);
+      e.env -= dec*e.env;
+      if (e.env <= 0.0008f){ e.env = 0.0f; e.st = ENV_IDLE; }
+    } break;
+    default: e.env = 0.0f; break;
+  }
+  return e.env;
+}
+
+inline void pluck_init(PluckPool& p){
+  p.gain = 0.35f;
+  for (int i=0;i<4;++i){ p.v[i] = PluckVoice(); }
+  p.inited = true;
+}
+
+inline void pluck_noteOn(PluckPool& p, int midi, float vel){
+  if (!p.inited) pluck_init(p);
+
+  // voice allocate: free first, else quietest env
+  int idx = -1; float minEnv = 1e9f;
+  for (int i=0;i<4;++i){ if (!p.v[i].active){ idx=i; break; } }
+  if (idx < 0){
+    for (int i=0;i<4;++i){
+      float e = p.v[i].eg.env;
+      if (e < minEnv){ minEnv = e; idx = i; }
+    }
+  }
+
+  PluckVoice& v = p.v[idx];
+  // quantize to current scale
+  int q = quantizeMidi(midi, gScale);
+  v.midi   = q;
+  v.freqHz = midiToHz(q);
+  v.phase  = 0.0f;
+  v.vel    = constrain(vel, 0.0f, 1.0f);
+  v.eg.env = 0.0f;
+  v.eg.st  = ENV_ATTACK;
+  v.eg.gate= false;          // pluck: short gate
+  v.active = true;
+}
+
+inline float pluck_step(PluckPool& p, float sr){
+  if (!p.inited) return 0.0f;
+  float sum = 0.0f;
+  for (int i=0;i<4;++i){
+    PluckVoice& v = p.v[i];
+    if (!v.active) continue;
+
+    float env = adsr_step(v.eg, sr);
+    if (v.eg.st == ENV_IDLE){ v.active=false; continue; }
+
+    // ultra-light osc (sine)
+    v.phase += (TAU * (v.freqHz / sr));
+    if (v.phase >= TAU) v.phase -= TAU;
+    float s = sinf(v.phase);
+
+    sum += s * env * v.vel;
+  }
+  return sum * p.gain;
+}
+
 
 inline void pad_init(Pad& p, float sr) {
   p.v1.freqHz = p.baseHz;
@@ -357,6 +509,72 @@ inline float pad_step(Pad& p, float sr) {
   // gentle LPF
   s = lp_process(p.lp, s);
   return s;
+}
+
+// DELAY / SPACE
+inline uint32_t delay_samples_from_bpm(int bpm, DelayMode m){
+  if (bpm < 30) bpm = 30;
+  float qnote = (SR * 60.0f) / (float)bpm;       // samples per 1/4
+  float want  = (m == DELAY_1_8) ? (qnote * 0.5f) : qnote;
+  uint32_t s  = (uint32_t)(want + 0.5f);
+  if (s < 1u) s = 1u;
+  if (s >= DELAY_MAX_SAMPLES) s = DELAY_MAX_SAMPLES - 1u;
+  return s;
+}
+
+inline void delay_init(Delay& dl, int bpm, DelayMode m, float toneCutHz){
+  dl.size = DELAY_MAX_SAMPLES;
+  dl.w = 0;
+  for (uint32_t i=0;i<dl.size;++i) dl.buf[i] = 0;
+  dl.mode = m;
+  dl.bpmCached = (uint16_t)bpm;
+  dl.dSamp = delay_samples_from_bpm(bpm, m);
+  lp_set(dl.tone, toneCutHz, SR);
+  dl.inited = true;
+}
+
+inline void delay_update_tempo_if_changed(Delay& dl, int bpm){
+  if (!dl.inited) return;
+  if (bpm != (int)dl.bpmCached){
+    dl.bpmCached = (uint16_t)bpm;
+    dl.dSamp = delay_samples_from_bpm(bpm, dl.mode);
+  }
+}
+
+inline void delay_set_mode(Delay& dl, DelayMode m){
+  dl.mode = m;
+  dl.dSamp = delay_samples_from_bpm(dl.bpmCached, m);
+}
+
+inline void delay_set_space(Delay& dl, int spacePct){
+  float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
+  float k = sqrtf(t);            // expand low range for audibility
+
+  dl.send = 0.75f * k;           // dry → delay input
+  dl.wet  = 0.55f * k;           // wet mix back to output
+  float fb = 0.55f * k;          // feedback kept safe
+  if (fb > 0.6f) fb = 0.6f;
+  dl.fb = fb;
+}
+
+inline float delay_step(Delay& dl, float dry){
+  if (!dl.inited) return 0.0f;
+
+  uint32_t r = (dl.w + dl.size - dl.dSamp) % dl.size;
+  int16_t r16 = dl.buf[r];
+  float delayed = (float)r16 * (1.0f / 32767.0f);
+
+  // feedback tone
+  float fbSample = lp_process(dl.tone, delayed);
+
+  // input to buffer: dry*send + fb*fbSample, gently clamped
+  float toWrite = (dry * dl.send) + (fbSample * dl.fb);
+  if (toWrite > 1.0f) toWrite = 1.0f;
+  if (toWrite < -1.0f) toWrite = -1.0f;
+  dl.buf[dl.w] = (int16_t)(toWrite * 32767.0f);
+
+  dl.w++; if (dl.w >= dl.size) dl.w = 0;
+  return delayed; // wet tap output
 }
 // -------- Soft clip (tanh-ish) --------
 inline float softClip(float x) {
@@ -408,15 +626,23 @@ void applyEncoderDelta(int steps){
     params.volumePercent = clampVolume(params.volumePercent + delta);
     // route to existing volume smoothing path
     volTarget = (float)params.volumePercent;
-  } else { // PAGE_TEMPO
+  }  else if (currentPage == PAGE_TEMPO) { // PAGE_TEMPO
     params.tempoBPM = clampTempo(params.tempoBPM + delta);
+  } else { // PAGE_SPACE
+    params.spacePercent += delta;
+    if (params.spacePercent < 0) params.spacePercent = 0;
+    if (params.spacePercent > 100) params.spacePercent = 100;
+    // reflect mapping immediately
+    delay_set_space(gDelay, params.spacePercent);
   }
 }
 
 
 // --- UI draw for flat pages ---
 void uiMaybeRedraw(){
-  int shownVal = (currentPage == PAGE_VOLUME) ? params.volumePercent : params.tempoBPM;
+  int shownVal = (currentPage == PAGE_VOLUME) ? params.volumePercent
+                : (currentPage == PAGE_TEMPO) ? params.tempoBPM
+                : params.spacePercent; // PAGE_SPACE
   if (lastPageShown == (int)currentPage && lastValShown == shownVal) return;
 
   char line[32];
@@ -489,6 +715,11 @@ void setup() {
   params.tempoBPM = 104;                 // default tempo per request
   clock_init(gClock, params.tempoBPM);   // start the 1/16 clock
 
+  // delay init 
+  params.spacePercent = 45;                 // more obvious by default
+  delay_init(gDelay, params.tempoBPM, DELAY_1_4, 2800.0f);  // darker tone, longer tap
+  delay_set_space(gDelay, params.spacePercent);
+
   // I2S
   i2sInit();
 }
@@ -520,13 +751,18 @@ void loop() {
   if (fade < 1.0f) { fade += (float)CHUNK / (SR * 0.8f); if (fade > 1.0f) fade = 1.0f; }
 
   clock_update_tempo_if_changed(gClock, params.tempoBPM);
+  delay_update_tempo_if_changed(gDelay, params.tempoBPM);
+
 
   for (int i = 0; i < CHUNK; ++i) {
-    float s = pad_step(pad, SR);          // <— new gentle pad source
+    float dry = pad_step(pad, SR) + pluck_step(gPluck, SR); // existing voices
 
-    float x = s * volSmooth * fade;       // gain + fade
-    x = dc.process(x);                    // DC block
-    x = softClip(x);                      // soft clip
+    float wetTap = delay_step(gDelay, dry);   // tempo-aware delay
+    float s = dry + gDelay.wet * wetTap;      // apply wet mix
+
+    float x = s * volSmooth * fade;           // master gain + fade
+    x = dc.process(x);                        // DC block
+    x = softClip(x);                          // soft clip
 
     int16_t v = (int16_t)floorf(x * 32767.0f);
     int j = i * 2;
