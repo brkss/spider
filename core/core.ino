@@ -67,6 +67,17 @@ struct Pad {
   bool inited = false;
 };
 
+// --- [NEW] Musical clock types/state (place with other structs/globals) ---
+struct Clock16 {
+  uint64_t smpNow = 0;          // running sample counter
+  uint64_t nextTickAt = 0;      // absolute sample index of next 1/16 tick
+  uint32_t samplesPerTick = 0;  // samples per 1/16 note
+  uint16_t step16 = 0;          // 0..15
+  uint16_t bpm = 104;           // cached tempo
+};
+
+static Clock16 gClock;
+
 // -------- Audio constants --------
 static const int   SR   = 44100;
 static const float TAU  = 6.28318530718f;
@@ -180,8 +191,6 @@ inline float osc_sine_tri(Osc& o, float sr) {
   return (1.0f - mix) * s + mix * tri;
 }
 
-
-
 inline void lp_set(OnePoleLP& f, float cutoffHz, float sr) {
   f.a = 1.0f - expf(-(TAU * cutoffHz) / sr);
 }
@@ -190,6 +199,44 @@ inline float lp_process(OnePoleLP& f, float x) {
   return f.y;
 }
 
+
+
+// --- [NEW] Clock helpers & tick stub ---
+inline uint32_t clock_spt_from_bpm(int bpm){
+  if (bpm < 30) bpm = 30;
+  return (uint32_t)((SR * 60.0f) / (bpm * 4.0f) + 0.5f); // 1/16 = quarter/4
+}
+
+inline void clock_init(Clock16& c, int bpm){
+  c.bpm = (uint16_t)bpm;
+  c.samplesPerTick = clock_spt_from_bpm(bpm);
+  c.smpNow = 0;
+  c.nextTickAt = c.samplesPerTick;
+  c.step16 = 0;
+}
+
+inline void clock_update_tempo_if_changed(Clock16& c, int bpm){
+  if (bpm != (int)c.bpm){
+    c.bpm = (uint16_t)bpm;
+    c.samplesPerTick = clock_spt_from_bpm(bpm);
+    c.nextTickAt = c.smpNow + c.samplesPerTick; // re-arm from "now"
+  }
+}
+
+// Called on every 1/16 step (no audible click; default no-op)
+inline void onStep16(uint16_t step){
+  (void)step; // placeholder for future actions
+}
+
+inline void clock_advance_block(Clock16& c, uint32_t blockSamples){
+  uint64_t blockEnd = c.smpNow + blockSamples;
+  while (c.nextTickAt <= blockEnd){
+    onStep16(c.step16);
+    c.step16 = (c.step16 + 1u) & 0x0Fu;
+    c.nextTickAt += c.samplesPerTick;
+  }
+  c.smpNow = blockEnd;
+}
 
 
 inline void pad_init(Pad& p, float sr) {
@@ -345,6 +392,10 @@ void setup() {
   tftInit();
   tftShowVolume((int)volTarget);
 
+  // musical clock init 
+  params.tempoBPM = 104;                 // default tempo per request
+  clock_init(gClock, params.tempoBPM);   // start the 1/16 clock
+
   // I2S
   i2sInit();
 }
@@ -375,6 +426,8 @@ void loop() {
   updateVolumeSmoothing();
   if (fade < 1.0f) { fade += (float)CHUNK / (SR * 0.8f); if (fade > 1.0f) fade = 1.0f; }
 
+  clock_update_tempo_if_changed(gClock, params.tempoBPM);
+
   for (int i = 0; i < CHUNK; ++i) {
     float s = pad_step(pad, SR);          // <— new gentle pad source
 
@@ -390,4 +443,5 @@ void loop() {
 
   size_t written = 0;
   i2s_write(I2S_NUM_0, (const char*)buf, sizeof(buf), &written, portMAX_DELAY);
+  clock_advance_block(gClock, (uint32_t)CHUNK);
 }
