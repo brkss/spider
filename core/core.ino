@@ -103,6 +103,38 @@ struct Delay {
 
 static Delay gDelay;
 
+// --- [NEW] Light Reverb (4 combs + 2 allpasses) ---
+#define RV_COMB1 1117
+#define RV_COMB2 1189
+#define RV_COMB3 1277
+#define RV_COMB4 1361
+#define RV_AP1    225
+#define RV_AP2    341
+
+static int16_t rvCombBuf1[RV_COMB1];
+static int16_t rvCombBuf2[RV_COMB2];
+static int16_t rvCombBuf3[RV_COMB3];
+static int16_t rvCombBuf4[RV_COMB4];
+static int16_t rvApBuf1[RV_AP1];
+static int16_t rvApBuf2[RV_AP2];
+
+struct CombLite {
+  int16_t* buf = nullptr; uint16_t size = 0, w = 0;
+  float fb = 0.62f, damp = 0.22f, filt = 0.0f; // LP in feedback path
+};
+struct AllpassLite {
+  int16_t* buf = nullptr; uint16_t size = 0, w = 0;
+  float g = 0.5f;
+};
+struct ReverbLite {
+  CombLite c[4];
+  AllpassLite ap1, ap2;
+  float send = 0.0f; // dry → reverb in
+  float wet  = 0.0f; // reverb tap → mix
+  bool inited = false;
+};
+static ReverbLite gReverb;
+
 // --- [NEW] Lightweight Pluck: voice/pool & tiny RNG (place with other types/globals) ---
 enum EnvState : uint8_t { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
@@ -511,6 +543,75 @@ inline float pad_step(Pad& p, float sr) {
   return s;
 }
 
+
+// REVERB 
+inline void reverb_init(ReverbLite& r){
+  r.c[0].buf = rvCombBuf1; r.c[0].size = RV_COMB1; r.c[0].w = 0; r.c[0].filt = 0;
+  r.c[1].buf = rvCombBuf2; r.c[1].size = RV_COMB2; r.c[1].w = 0; r.c[1].filt = 0;
+  r.c[2].buf = rvCombBuf3; r.c[2].size = RV_COMB3; r.c[2].w = 0; r.c[2].filt = 0;
+  r.c[3].buf = rvCombBuf4; r.c[3].size = RV_COMB4; r.c[3].w = 0; r.c[3].filt = 0;
+  for (uint16_t i=0;i<RV_COMB1;i++) rvCombBuf1[i]=0;
+  for (uint16_t i=0;i<RV_COMB2;i++) rvCombBuf2[i]=0;
+  for (uint16_t i=0;i<RV_COMB3;i++) rvCombBuf3[i]=0;
+  for (uint16_t i=0;i<RV_COMB4;i++) rvCombBuf4[i]=0;
+
+  r.ap1.buf = rvApBuf1; r.ap1.size = RV_AP1; r.ap1.w = 0; r.ap1.g = 0.5f;
+  r.ap2.buf = rvApBuf2; r.ap2.size = RV_AP2; r.ap2.w = 0; r.ap2.g = 0.5f;
+  for (uint16_t i=0;i<RV_AP1;i++) rvApBuf1[i]=0;
+  for (uint16_t i=0;i<RV_AP2;i++) rvApBuf2[i]=0;
+
+  r.inited = true;
+}
+
+inline float comb_step(CombLite& c, float x){
+  int16_t rd = c.buf[c.w];            // delay = buffer length
+  float y = rd * (1.0f/32767.0f);
+  c.filt += c.damp * (y - c.filt);    // tone in feedback
+  float wr = x + c.fb * c.filt;
+  if (wr > 1.0f) wr = 1.0f; if (wr < -1.0f) wr = -1.0f;
+  c.buf[c.w] = (int16_t)(wr * 32767.0f);
+  c.w++; if (c.w >= c.size) c.w = 0;
+  return y;
+}
+
+inline float allpass_step(AllpassLite& a, float x){
+  int16_t rd = a.buf[a.w];
+  float z = rd * (1.0f/32767.0f);
+  float y = -x + z;
+  float wr = x + a.g * y;
+  if (wr > 1.0f) wr = 1.0f; if (wr < -1.0f) wr = -1.0f;
+  a.buf[a.w] = (int16_t)(wr * 32767.0f);
+  a.w++; if (a.w >= a.size) a.w = 0;
+  return y;
+}
+
+inline void reverb_set_space(ReverbLite& r, int spacePct){
+  float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
+  float k = sqrtf(t);                 // audible at low values
+  r.send = 0.70f * k;
+  r.wet  = 0.35f * k;
+
+  float fb = 0.45f + 0.27f * k;       // 0.45 → 0.72
+  if (fb > 0.75f) fb = 0.75f;
+  float damp = 0.15f + 0.20f * k;     // darker→airier with space
+
+  for (int i=0;i<4;i++){ r.c[i].fb = fb; r.c[i].damp = damp; }
+}
+
+inline float reverb_step(ReverbLite& r, float dry){
+  if (!r.inited) reverb_init(r);
+  float xin = r.send * dry;
+  float y = 0.0f;
+  y += comb_step(r.c[0], xin);
+  y += comb_step(r.c[1], xin);
+  y += comb_step(r.c[2], xin);
+  y += comb_step(r.c[3], xin);
+  y *= 0.25f;                 // average the combs
+  y = allpass_step(r.ap1, y);
+  y = allpass_step(r.ap2, y);
+  return y;
+}
+
 // DELAY / SPACE
 inline uint32_t delay_samples_from_bpm(int bpm, DelayMode m){
   if (bpm < 30) bpm = 30;
@@ -548,13 +649,16 @@ inline void delay_set_mode(Delay& dl, DelayMode m){
 
 inline void delay_set_space(Delay& dl, int spacePct){
   float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
-  float k = sqrtf(t);            // expand low range for audibility
+  float k = sqrtf(t);
 
   dl.send = 0.75f * k;           // dry → delay input
   dl.wet  = 0.55f * k;           // wet mix back to output
   float fb = 0.55f * k;          // feedback kept safe
   if (fb > 0.6f) fb = 0.6f;
   dl.fb = fb;
+
+  // NEW: tie Space to reverb as well
+  reverb_set_space(gReverb, spacePct);
 }
 
 inline float delay_step(Delay& dl, float dry){
@@ -755,14 +859,16 @@ void loop() {
 
 
   for (int i = 0; i < CHUNK; ++i) {
-    float dry = pad_step(pad, SR) + pluck_step(gPluck, SR); // existing voices
+    float dry = /*pad_step(pad, SR) +*/ pluck_step(gPluck, SR);
 
-    float wetTap = delay_step(gDelay, dry);   // tempo-aware delay
-    float s = dry + gDelay.wet * wetTap;      // apply wet mix
+    float wetTap  = delay_step(gDelay,  dry);     // tempo-aware delay
+    float wetRev  = reverb_step(gReverb, dry);    // light reverb
 
-    float x = s * volSmooth * fade;           // master gain + fade
-    x = dc.process(x);                        // DC block
-    x = softClip(x);                          // soft clip
+    float s = dry + gDelay.wet * wetTap + gReverb.wet * wetRev;
+
+    float x = s * volSmooth * fade;
+    x = dc.process(x);
+    x = softClip(x);
 
     int16_t v = (int16_t)floorf(x * 32767.0f);
     int j = i * 2;
