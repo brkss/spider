@@ -78,6 +78,23 @@ struct Clock16 {
 
 static Clock16 gClock;
 
+// --- [NEW] Scales: enums, defs, and table ---
+enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
+
+struct ScaleDef {
+  uint8_t rootPC;        // 0..11 (C=0, C#=1, ... A=9, B=11)
+  uint8_t degrees[7];    // diatonic degrees as pitch-class offsets from root
+  uint8_t count;         // always 7 here
+};
+
+static const ScaleDef SCALES[(int)SCALE_COUNT] = {
+  /* A minor (Aeolian) */ { 9, {0,2,3,5,7,8,10}, 7 },
+  /* D dorian          */ { 2, {0,2,3,5,7,9,10}, 7 },
+  /* C lydian          */ { 0, {0,2,4,6,7,9,11}, 7 }
+};
+
+inline const ScaleDef& scaleDef(Scale s) { return SCALES[(int)s]; }
+
 // -------- Audio constants --------
 static const int   SR   = 44100;
 static const float TAU  = 6.28318530718f;
@@ -236,6 +253,82 @@ inline void clock_advance_block(Clock16& c, uint32_t blockSamples){
     c.nextTickAt += c.samplesPerTick;
   }
   c.smpNow = blockEnd;
+}
+
+inline int quantizeMidi(int midi, Scale s) {
+  const ScaleDef& sd = scaleDef(s);
+  auto pc12 = [](int m){ int x = m % 12; return (x < 0) ? x + 12 : x; };
+
+  const int inPC = pc12(midi);
+  int bestDiff = 127;      // signed semitone diff to add to midi
+  int bestAbs  = 128;      // |diff|
+  for (int i = 0; i < sd.count; ++i) {
+    int targetPC = (sd.rootPC + sd.degrees[i]) % 12;
+    int d = targetPC - inPC;              // -11..+11 after wrapping:
+    if (d > 6)  d -= 12;
+    if (d < -6) d += 12;
+    int ad = (d >= 0) ? d : -d;
+    // Tie-break upward (prefer >=)
+    if (ad < bestAbs || (ad == bestAbs && d > bestDiff)) {
+      bestAbs = ad;
+      bestDiff = d;
+    }
+  }
+  int out = midi + bestDiff;
+  if (out < 0) out = 0; if (out > 127) out = 127;
+  return out;
+}
+
+inline int pickAmbientNote(Scale s, int centerMidi) {
+  const ScaleDef& sd = scaleDef(s);
+  auto pc12 = [](int m){ int x = m % 12; return (x < 0) ? x + 12 : x; };
+
+  int base = quantizeMidi(centerMidi, s);
+
+  // Small diatonic step pattern (center-biased, deterministic cycle)
+  static const int OFFS[] = { 0, 1, -1, 2, -2, 3, -3, 4, -4, 1, 0, -1 };
+  static uint8_t idx = 0;
+  int steps = OFFS[idx++ % (sizeof(OFFS)/sizeof(OFFS[0]))];
+
+  auto nextUpDelta = [&](int currentPC)->int {
+    int best = 12; // minimal positive semitones to next allowed PC
+    for (int i = 0; i < sd.count; ++i) {
+      int pc = (sd.rootPC + sd.degrees[i]) % 12;
+      int d = (pc - currentPC + 12) % 12;
+      if (d == 0) d = 12;       // same PC => go to next octave
+      if (d < best) best = d;
+    }
+    return best; // 1..12
+  };
+  auto prevDownDelta = [&](int currentPC)->int {
+    int best = 12; // minimal positive semitones to previous allowed PC
+    for (int i = 0; i < sd.count; ++i) {
+      int pc = (sd.rootPC + sd.degrees[i]) % 12;
+      int d = (currentPC - pc + 12) % 12;
+      if (d == 0) d = 12;       // same PC => go to previous octave
+      if (d < best) best = d;
+    }
+    return best; // 1..12 (to step downward)
+  };
+
+  int out = base;
+  if (steps > 0) {
+    for (int k = 0; k < steps; ++k) {
+      int curPC = pc12(out);
+      out += nextUpDelta(curPC);
+    }
+  } else if (steps < 0) {
+    for (int k = 0; k < -steps; ++k) {
+      int curPC = pc12(out);
+      out -= prevDownDelta(curPC);
+    }
+  }
+
+  // Optional gentle clamp to a practical range (leave plenty of room)
+  if (out < 24) out = 24;      // C1
+  if (out > 108) out = 108;    // C8-
+
+  return out;
 }
 
 
