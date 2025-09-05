@@ -35,6 +35,8 @@
 //#define ST7735_TAB INITR_GREENTAB
 //#define ST7735_TAB INITR_REDTAB
 
+
+
 // --- [NEW] Master makeup gain to boost overall loudness ---
 static const float MASTER_GAIN = 1.35f;  // ~+2.6 dB headroom into soft clip
 
@@ -42,6 +44,7 @@ enum DelayMode : uint8_t { DELAY_1_8 = 0, DELAY_1_4 };
 enum Scale : uint8_t { SCALE_C_MINOR = 0, SCALE_A_MINOR, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
 enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_MOOD, PAGE_TONE, PAGE_ENERGY, PAGE_SCENE, PAGE_COUNT };
 
+static inline int pickAmbientNote(Scale s, int centerMidi);
 
 struct Params {
   int volumePercent; // 0..100
@@ -68,16 +71,16 @@ struct OnePoleLP {
 // Gentle pad: 3 detuned osc → amp-LFO → LPF
 struct Pad {
   Osc v1, v2, v3;
-  float baseHz = 160.0f;
-  float det = 0.012f;        // ±1.2%
-  float triMix = 0.30f;      // sine/triangle blend
+  float baseHz = 180.0f;
+  float det = 0.0f;        // ±1.2%
+  float triMix = 0.18f;      // sine/triangle blend
   // Amp LFO
   float ampLfoPhase = 0.0f;
-  float ampLfoRateHz = 0.08f;
-  float ampLfoDepth = 0.25f; // 0..1
+  float ampLfoRateHz = 0.05f;
+  float ampLfoDepth = 0.18f; // 0..1
   // LPF
   OnePoleLP lp;
-  float lpfCutHz = 1800.0f;
+  float lpfCutHz = 1200.0f;
   bool inited = false;
 };
 
@@ -92,6 +95,23 @@ struct Clock16 {
 
 static Clock16 gClock;
 
+// --- Pink noise (Paul Kellet approx) + band limit (HP ~150 Hz, LP ~5 kHz)
+struct PinkNoise {
+  float b0=0, b1=0, b2=0;
+  OnePoleLP hpSplit;   // used to make a 1-pole high-pass: x - lp(x)
+  OnePoleLP lpAir;     // top-end low-pass (air band)
+  bool inited=false;
+};
+static PinkNoise gPink;
+static const float NOISE_DRY_GAIN = 0.0f;   // keep 0.0 for FX-only
+static const float NOISE_FX_GAIN  = 0.12f;  // try 0.08–0.20
+
+
+
+// --- Drone pitch random-walk state ---
+static float pitchTargetHz = 160.0f;     // target frequency
+static float pitchSmoothHz = 160.0f;     // smoothed frequency
+static uint32_t nextPitchChange = 0;     // millis() when to step next
 
 #if defined(DELAY_MAX_SAMPLES)
   #undef DELAY_MAX_SAMPLES
@@ -210,7 +230,7 @@ static ReverbLite gReverb;
 enum EnvState : uint8_t { ENV_IDLE, ENV_ATTACK, ENV_DECAY, ENV_SUSTAIN, ENV_RELEASE };
 
 struct ADSR {
-  float a=0.008f, d=0.22f, s=0.20f, r=0.14f; // soft pluck
+  float a = 0.003f, d = 0.080f, s = 0.00f, r = 0.060f;
   float env=0.0f;
   EnvState st=ENV_IDLE;
   bool gate=false;
@@ -484,45 +504,44 @@ inline int quantizeMidi(int midi, Scale s) {
   return out;
 }
 
-// Replace your existing pickAmbientNote with this version
-inline int pickAmbientNote(Scale s, int centerMidi) {
-  // Initialize the walking note around the provided center, quantized to scale
-  static bool init = false;
-  static int  curMidi = 60;  // persistent between calls
-  if (!init) {
-    curMidi = quantizeMidi(centerMidi, s);
-    // keep in a practical musical range
-    if (curMidi < 36) curMidi = 36;   // C2
-    if (curMidi > 96) curMidi = 96;   // C7
-    init = true;
+inline int pickAmbientNote(Scale s, int /*centerMidi*/) {
+  static int last = 60;               // remember only to avoid tiny steps
+  const ScaleDef& sd = scaleDef(s);
+
+  // Build a small pool of allowed MIDI notes in a comfy register (C2..C7)
+  // Root is the scale root; degrees are added across several octaves.
+  int pool[64]; int n = 0;
+  for (int octave = 2; octave <= 6; ++octave) {          // 2..6 => 36..96
+    int base = octave * 12 + sd.rootPC;                  // octave root
+    for (int i = 0; i < sd.count; ++i) {
+      int m = base + sd.degrees[i];
+      if (m >= 36 && m <= 96) pool[n++] = m;
+    }
   }
 
-  // --- Small, musical random walk (center-biased) ---
-  // More zeros/±1 for smoother motion; occasional larger steps
-  static const int STEPS[9] = { -3, -2, -1, 0, 0, 0, +1, +2, +3 };
-  int step = STEPS[rng32() % 9];
+  // Pick a random candidate; avoid tiny stepwise motions
+  int cand = pool[rng32() % n];
 
-  // Occasional octave hop to break repetition (~12% chance)
-  if (rand01() < 0.12f) {
-    step += (rand01() < 0.5f ? +2 : -2);
+  // 10% chance to HOLD (modular "sample & hold" feel)
+  if (rand01() < 0.10f) return last;
+
+  // 15% chance to force a wide modular interval (±5 or ±7 semitones)
+  if (rand01() < 0.15f) {
+    cand += (rng32() & 1) ? +7 : -5;
   }
 
-  // Move, then quantize to the current scale (keeps it diatonic)
-  curMidi = quantizeMidi(curMidi + step, s);
-
-  // Softly pull back toward the requested center over time (prevents drift)
-  // ~10% chance per call to nudge 1 semitone toward the current center
-  if (rand01() < 0.10f) {
-    int target = quantizeMidi(centerMidi, s);
-    if (curMidi < target)      curMidi = quantizeMidi(curMidi + 1, s);
-    else if (curMidi > target) curMidi = quantizeMidi(curMidi - 1, s);
+  // If too close to last (|Δ| < 3 semitones), push to a non-adjacent interval
+  if (abs(cand - last) < 3) {
+    cand += (rng32() & 1) ? +7 : -5;   // perfect 5th / 4th flavor
   }
 
-  // Clamp to a practical performance range
-  if (curMidi < 36) curMidi = 36;   // C2
-  if (curMidi > 96) curMidi = 96;   // C7
+  // Keep within range and re-quantize to scale
+  if (cand < 36) cand = 36;
+  if (cand > 96) cand = 96;
+  cand = quantizeMidi(cand, s);
 
-  return curMidi;
+  last = cand;
+  return cand;
 }
 
 // --- [NEW] Pluck helpers: RNG, ADSR, noteOn, render ---
@@ -632,6 +651,11 @@ inline float pad_step(Pad& p, float sr) {
   float s = (osc_sine_tri(p.v1, sr) + osc_sine_tri(p.v2, sr) + osc_sine_tri(p.v3, sr)) * (1.0f / 3.0f);
   s *= amp;
 
+  // pre-filter soft saturation (tames spiky highs without harshness)
+  s = tanhf(0.6f * s);
+
+
+
   // gentle LPF
   s = lp_process(p.lp, s);
   return s;
@@ -720,10 +744,11 @@ inline void mood_set(Pad& pad, ReverbLite& rv, int moodPct){
   float k = moodPct * (1.0f/100.0f);   // 0..1
 
   // LPF cutoff: log map 400 → 8000 Hz
-  float cut = 400.0f * powf(20.0f, k); // 400 * 20^k
-  pad.lpfCutHz = cut;
+  // darker & smoother: 300 → ~5 kHz max
+  float cut= 300.0f * powf(16.0f, k); // caps ~4800 Hz
+  pad.triMix = 0.08f + 0.37f * k;      // 0.08..0.45 (stays mostly sine)
   lp_set(pad.lp, pad.lpfCutHz, SR);
-
+ 
   // Osc shape: sine→triangle blend (gentle range)
   pad.triMix = 0.10f + 0.60f * k;      // 0.10 .. 0.70
   pad.v1.triMix = pad.v2.triMix = pad.v3.triMix = pad.triMix;
@@ -1037,6 +1062,34 @@ inline void scene_update(uint64_t nowSmp){
   }
 }
 
+// Pink Noise 
+
+inline void pink_init(PinkNoise& p){
+  p.b0 = p.b1 = p.b2 = 0.0f;
+  lp_set(p.hpSplit, 150.0f, SR);   // remove HVAC/rumble
+  lp_set(p.lpAir,  5000.0f, SR);   // keep only airy band
+  p.inited = true;
+}
+
+inline float pink_step(PinkNoise& p){
+  if (!p.inited) pink_init(p);
+
+  // white in [-1,1)
+  float w = (int32_t)rng32() * (1.0f / 2147483648.0f);
+
+  // Paul Kellet 3-pole pink approximation
+  p.b0 = 0.99765f * p.b0 + 0.0990460f * w;
+  p.b1 = 0.96300f * p.b1 + 0.2965164f * w;
+  p.b2 = 0.57000f * p.b2 + 1.0526913f * w;
+  float y = (p.b0 + p.b1 + p.b2 + 0.1848f * w) * 0.05f;  // scaled down
+
+  // band limit: HP via split LP, then LP for air
+  float low  = lp_process(p.hpSplit, y);
+  float high = y - low;                    // ~150 Hz high-pass
+  float air  = lp_process(p.lpAir, high);  // ~5 kHz low-pass
+  return air;
+}
+
 // --- [NEW] Gesture update & apply (call once per block, AFTER scene_update) ---
 inline void gesture_update_and_apply(uint64_t nowSmp){
   // keep lambda tied to current Energy mapping
@@ -1243,12 +1296,18 @@ void setup() {
   params.moodPercent = 50;
   params.tonePercent = 50;
   tone_init(gTilt);
+  params.tonePercent = 42;   // was 50; a touch warmer by default
+  tone_set(gTilt, params.tonePercent);
   mood_set(pad, gReverb, params.moodPercent);
   tone_set(gTilt, params.tonePercent);
 
+  
   // energy 
   params.energyPercent = 50;
   energy_set(gEnergy, pad, params.energyPercent);
+
+  // noise 
+  pink_init(gPink);
 
   // I2S
   i2sInit();
@@ -1283,76 +1342,93 @@ void loop() {
   clock_update_tempo_if_changed(gClock, params.tempoBPM);
   delay_update_tempo_if_changed(gDelay, params.tempoBPM);
 
+  const float CTR = 0.70710678f;  // −3 dB center for mono returns
 
-  // mixer blaah
-  float tSpace = constrain(params.spacePercent, 0, 100) * 0.01f;
-  float width  = 0.35f + (1.10f - 0.35f) * sqrtf(tSpace);  // 0.35..1.10
-  const float CTR = 0.70710678f;  // -3 dB center
+  // --- Slow random walk for drone pitch ---
+  uint32_t now = millis();
+  if (now >= nextPitchChange) {
+    // step target by -2..+2 Hz
+    float step = (rand01() * 4.0f) - 2.0f;
+    pitchTargetHz += step;
+
+    // clamp to safe range 100..220 Hz
+    if (pitchTargetHz < 100.0f) pitchTargetHz = 100.0f;
+    if (pitchTargetHz > 220.0f) pitchTargetHz = 220.0f;
+
+    // schedule next change in 3–7 seconds
+    nextPitchChange = now + 3000 + (uint32_t)(rand01() * 4000.0f);
+  }
+
+  // smooth toward target (≈15s time constant)
+  const float alphaPitch = 1.0f - expf(-(float)CHUNK / (SR * 15.0f));
+  pitchSmoothHz += alphaPitch * (pitchTargetHz - pitchSmoothHz);
+
+  // apply smoothed base pitch to pad oscillators
+  pad.baseHz = pitchSmoothHz;
+  pad.v1.freqHz = pad.baseHz;
+  pad.v2.freqHz = pad.baseHz * (1.0f + pad.det);
+  pad.v3.freqHz = pad.baseHz * (1.0f - pad.det);
   for (int i = 0; i < CHUNK; ++i) {
-    // Pad (mono, centered with -3 dB law)
+    // --- Pad (mono)
     float padMono = pad_step(pad, SR);
 
-    // Plucks: per-voice pan
-    float plL = 0.0f, plR = 0.0f, plMono = 0.0f;
-    for (int vi = 0; vi < 4; ++vi){
+    // --- Plucks (mono, no panning)
+    float plMono = 0.0f;
+    for (int vi = 0; vi < 4; ++vi) {
       PluckVoice &v = gPluck.v[vi];
       if (!v.active) continue;
 
-      // Mild random pan when a note starts (first attack)
-      if (v.eg.st == ENV_ATTACK && v.eg.env == 0.0f) {
-        if (v.pan == 0.0f) v.pan = (rand01()*2.0f - 1.0f) * 0.35f; // ±0.35
-      }
-
       float env = adsr_step(v.eg, SR);
-      if (v.eg.st == ENV_IDLE){ v.active = false; continue; }
+      if (v.eg.st == ENV_IDLE) { v.active = false; continue; }
 
       v.phase += TAU * (v.freqHz / SR);
       if (v.phase >= TAU) v.phase -= TAU;
+
+      // 2-osc mix: 80% sine + 20% rectangle (30% duty)
       float sSin = sinf(v.phase);
-      float duty = 0.30f;  
-      float sSq = (fmodf(v.phase / TAU, 1.0f) < duty) ? 1.0f : -1.0f;
+      float duty = 0.30f;
+      float sSq  = (fmodf(v.phase / TAU, 1.0f) < duty) ? 1.0f : -1.0f;
       float sMix = 0.80f * sSin + 0.20f * sSq;
 
-      float sV   = sMix * env * v.vel;
-
-      plMono += sV;
-      float gL, gR; panGains(v.pan, gL, gR);   // helper defined once at top
-      plL += sV * gL * gPluck.gain;
-      plR += sV * gR * gPluck.gain;
+      float sV = sMix * env * v.vel;
+      plMono += sV * gPluck.gain * 0.80f;   // keep your −20% gain
     }
 
-    // Build dry L/R
-    float L = padMono * CTR + plL;
-    float R = padMono * CTR + plR;
+    // Noise 
+    float n = pink_step(gPink);
+    float noiseDry = n * NOISE_DRY_GAIN;
+    float noiseFx  = n * NOISE_FX_GAIN;
 
-    // Mono dry bus for FX with tilt
-    float dryFX  = tone_process(gTilt, padMono + plMono);
+    // --- Build mono dry
+    float dryMono = padMono * CTR + plMono + noiseDry;
+
+    // --- FX bus (mono) with tone tilt
+    float dryFX  = tone_process(gTilt, dryMono + noiseFx);
     float wetTap = delay_step(gDelay,  dryFX);
     float wetRev = reverb_step(gReverb, dryFX);
     float wetSum = gDelay.wet * wetTap + gReverb.wet * wetRev;
 
-    // Center the FX returns
-    L += wetSum * CTR;
-    R += wetSum * CTR;
+    // Center FX return into mono
+    float outMono = dryMono + wetSum * CTR;
 
-    // Master width (mid/side)
-    applyWidth(L, R, width);                 // helper defined once at top
-
-    // Master gain, per-channel DC block and clip
-    float xL = L * volSmooth * fade * MASTER_GAIN;
-    float xR = R * volSmooth * fade * MASTER_GAIN;
-    xL = dcL.process(xL); xR = dcR.process(xR);  // per-channel DC (NOT mono dc)
-    xL = softClip(xL);    xR = softClip(xR);
+    // --- Master gain, DC block, clip
+    float x = outMono * volSmooth * fade * MASTER_GAIN;
+    // use per-channel DC if you like; same x to both is fine
+    float xL = dcL.process(x);
+    float xR = dcR.process(x);
+    xL = softClip(xL);
+    xR = softClip(xR);
 
     int j = i * 2;
-    buf[j + 0] = (int16_t)floorf(xL * 32767.0f);  // Left
-    buf[j + 1] = (int16_t)floorf(xR * 32767.0f);  // Right
+    buf[j + 0] = (int16_t)floorf(xL * 32767.0f);  // Left (mono)
+    buf[j + 1] = (int16_t)floorf(xR * 32767.0f);  // Right (mono)
   }
 
   size_t written = 0;
   i2s_write(I2S_NUM_0, (const char*)buf, sizeof(buf), &written, portMAX_DELAY);
   clock_advance_block(gClock, (uint32_t)CHUNK);
   maybeTriggerGesture(gEnergy, gClock.smpNow);
-  scene_update(gClock.smpNow);   // <— schedule & apply crossfade
-  gesture_update_and_apply(gClock.smpNow);  // <— overlay pad brightness & FX sends
+  scene_update(gClock.smpNow);
+  gesture_update_and_apply(gClock.smpNow);
 }
+
