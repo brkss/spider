@@ -14,6 +14,9 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 
+#include "esp_system.h"
+
+
 // -------- Fixed Pins (exact) --------
 #define I2S_DOUT 22
 #define I2S_BCLK 26
@@ -37,7 +40,9 @@ static const float MASTER_GAIN = 1.35f;  // ~+2.6 dB headroom into soft clip
 
 enum DelayMode : uint8_t { DELAY_1_8 = 0, DELAY_1_4 };
 enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
-enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_MOOD, PAGE_TONE, PAGE_ENERGY, PAGE_COUNT };
+enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_MOOD, PAGE_TONE, PAGE_ENERGY, PAGE_SCENE, PAGE_COUNT };
+
+
 struct Params {
   int volumePercent; // 0..100
   int tempoBPM;      // 30..240 (clamped)
@@ -94,14 +99,12 @@ static Clock16 gClock;
 #define DELAY_MAX_SAMPLES 32768  // ~0.74s @ 44.1k (1/4 note ≥ ~81 BPM), ≈64 KB
 
 struct Delay {
-  int16_t buf[DELAY_MAX_SAMPLES]; // mono ring buffer, no malloc
-  uint32_t size = DELAY_MAX_SAMPLES;
-  uint32_t w = 0;                 // write index
-  uint32_t dSamp = 22050;         // delay time in samples
-  OnePoleLP tone;                 // LP in feedback path
-  float send = 0.0f;              // dry → delay input
-  float wet  = 0.0f;              // wet tap mix
-  float fb   = 0.0f;              // feedback amount
+  int16_t buf[DELAY_MAX_SAMPLES];
+  uint32_t size = DELAY_MAX_SAMPLES, w = 0, dSamp = 22050;
+  OnePoleLP tone;
+  float baseSend = 0.0f, baseWet = 0.0f;  // <— NEW: remember base amounts
+  float send = 0.0f,  wet  = 0.0f;
+  float fb = 0.0f;
   uint16_t bpmCached = 104;
   DelayMode mode = DELAY_1_8;
   bool inited = false;
@@ -116,6 +119,32 @@ struct TiltEQ {
   bool inited = false;
 };
 static TiltEQ gTilt;
+
+// --- Sceen Cross Fade
+struct SceneTargets {
+  Scale     scale;
+  float     triMix;
+  float     lpfCutHz;
+  int       spacePercent;   // 0..100
+  DelayMode delayMode;      // DELAY_1_8 / DELAY_1_4
+  int       tempoBPM;       // 30..240
+};
+
+struct SceneXfade {
+  bool      active = false;
+  uint64_t  tStartSmp = 0, tEndSmp = 0;  // absolute sample times
+  SceneTargets start, target;
+};
+
+struct SceneScheduler {
+  uint64_t nextSceneAt = 0;
+  uint32_t minIntvSmp = 0;  // 120s
+  uint32_t maxIntvSmp = 0;  // 240s
+  bool     inited = false;
+};
+
+static SceneXfade     gScene;
+static SceneScheduler gSceneSch;
 
 // Explicit prototypes so Arduino's auto-prototyper doesn't mangle them
 static inline void  tone_init(TiltEQ& t);
@@ -137,6 +166,8 @@ struct EnergyCtrl {
   uint64_t nextGestureAt   = 0;
 };
 static EnergyCtrl gEnergy;
+
+
 
 // Prototypes (Arduino auto-proto can miss these)
 static inline uint32_t samplesFromExp(float lambdaHz);
@@ -169,8 +200,8 @@ struct AllpassLite {
 struct ReverbLite {
   CombLite c[4];
   AllpassLite ap1, ap2;
-  float send = 0.0f; // dry → reverb in
-  float wet  = 0.0f; // reverb tap → mix
+  float baseSend = 0.0f, baseWet = 0.0f; // <— NEW
+  float send = 0.0f,  wet  = 0.0f;
   bool inited = false;
 };
 static ReverbLite gReverb;
@@ -190,8 +221,9 @@ struct PluckVoice {
   int   midi=60;
   float freqHz=261.63f;
   float phase=0.0f;
-  float vel=0.7f;     // 0..1 subtle
+  float vel=0.7f;
   ADSR  eg;
+  float pan=0.0f;   // NEW: -1..+1 (L..R), set when note starts
 };
 
 struct PluckPool {
@@ -203,6 +235,24 @@ struct PluckPool {
 static PluckPool gPluck;
 static Scale gScale = SCALE_A_MINOR;      // use your quantizer scales
 static uint32_t gRng32 = 0xA3C59AC3u;     // tiny xorshift RNG state
+
+
+// Gestures
+// --- [NEW] Gesture controller (envelopes + overlay) ---
+struct GestureCtrl {
+  // scheduling
+  float lambdaHz = 1.0f/15.0f;  // modulated by Energy each block
+  uint64_t nextAt = 0;
+
+  // shape
+  bool active = false;
+  uint64_t tStart = 0, tAtkEnd = 0, tRelStart = 0, tEnd = 0;
+  float env = 0.0f;             // smoothed 0..1
+  float cutBoostOct = 0.5f;     // 0.25..0.80
+  float fxSendBoost = 0.5f;     // 0.30..0.70
+  float fxWetBoost  = 0.35f;    // 0.20..0.50
+};
+static GestureCtrl gGesture;
 
 // --- [NEW] Scales: enums, defs, and table ---
 struct ScaleDef {
@@ -271,6 +321,8 @@ inline const char* pageName(Page p){
     case PAGE_SPACE:  return "Space";
     case PAGE_MOOD:   return "Mood";
     case PAGE_TONE:   return "Tone";
+    case PAGE_ENERGY: return "Energy";
+    case PAGE_SCENE:  return "Scene";   // <—
     default:          return "?";
   }
 }
@@ -725,15 +777,16 @@ inline float allpass_step(AllpassLite& a, float x){
 
 inline void reverb_set_space(ReverbLite& r, int spacePct){
   float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
-  float k = sqrtf(t);                 // audible at low values
-  r.send = 0.70f * k;
-  r.wet  = 0.35f * k;
+  float k = sqrtf(t);
+  float send = 0.70f * k;
+  float wet  = 0.35f * k;
 
-  float fb = 0.45f + 0.27f * k;       // 0.45 → 0.72
-  if (fb > 0.75f) fb = 0.75f;
-  float damp = 0.15f + 0.20f * k;     // darker→airier with space
-
+  float fb = 0.45f + 0.27f * k; if (fb > 0.75f) fb = 0.75f;
+  float damp = 0.15f + 0.20f * k;
   for (int i=0;i<4;i++){ r.c[i].fb = fb; r.c[i].damp = damp; }
+
+  r.baseSend = send; r.baseWet = wet;
+  r.send = r.baseSend; r.wet = r.baseWet;               // live = base
 }
 
 inline float reverb_step(ReverbLite& r, float dry){
@@ -789,13 +842,14 @@ inline void delay_set_space(Delay& dl, int spacePct){
   float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
   float k = sqrtf(t);
 
-  dl.send = 0.75f * k;           // dry → delay input
-  dl.wet  = 0.55f * k;           // wet mix back to output
-  float fb = 0.55f * k;          // feedback kept safe
-  if (fb > 0.6f) fb = 0.6f;
-  dl.fb = fb;
+  float send = 0.75f * k;
+  float wet  = 0.55f * k;
+  float fb   = 0.55f * k; if (fb > 0.6f) fb = 0.6f;
 
-  // NEW: tie Space to reverb as well
+  dl.baseSend = send; dl.baseWet = wet; dl.fb = fb;
+  dl.send = dl.baseSend; dl.wet = dl.baseWet;          // live = base
+
+  // keep reverb tied to Space as before
   reverb_set_space(gReverb, spacePct);
 }
 
@@ -818,6 +872,9 @@ inline float delay_step(Delay& dl, float dry){
   dl.w++; if (dl.w >= dl.size) dl.w = 0;
   return delayed; // wet tap output
 }
+
+
+
 // -------- Soft clip (tanh-ish) --------
 inline float softClip(float x) {
   const float drive = 1.8f; // a touch more output
@@ -826,6 +883,7 @@ inline float softClip(float x) {
 
 // -------- Audio globals --------
 static DCBlock dc;
+static DCBlock dcL, dcR;
 static Pad pad;
 static float volTarget = 70.0f; // start louder so you can hear it
 static float volSmooth = 0.0f;  // smoothed linear gain
@@ -860,6 +918,211 @@ void tftShowVolume(int vol) {
   tft.print(line);
 }
 
+
+// crossfade / scene change 
+// --- [NEW] Scene update: schedule, pick targets, and crossfade (call this once per loop) ---
+inline void scene_update(uint64_t nowSmp){
+  // init scheduler window: 120–240 s
+  if (!gSceneSch.inited){
+    gSceneSch.minIntvSmp = (uint32_t)(120.0f * SR + 0.5f);
+    gSceneSch.maxIntvSmp = (uint32_t)(240.0f * SR + 0.5f);
+    gSceneSch.nextSceneAt = nowSmp + gSceneSch.minIntvSmp +
+                            (uint32_t)((gSceneSch.maxIntvSmp - gSceneSch.minIntvSmp) * rand01());
+    gSceneSch.inited = true;
+  }
+
+  // Helper lambdas
+  auto lerp = [](float a, float b, float t){ return a + (b - a) * t; };
+  auto smooth = [&](float t){ t = (t < 0.f)?0.f:((t>1.f)?1.f:t); return t*t*(3.f - 2.f*t); };
+  auto expLerp = [&](float aHz, float bHz, float t){ // log-space interpolation
+    float la = logf(aHz), lb = logf(bHz);
+    return expf(lerp(la, lb, t));
+  };
+
+  // Start a new scene if due and not already fading
+  if (!gScene.active && nowSmp >= gSceneSch.nextSceneAt){
+    // capture start from current live state
+    gScene.start.scale        = gScale;
+    gScene.start.triMix       = pad.triMix;
+    gScene.start.lpfCutHz     = pad.lpfCutHz;
+    gScene.start.spacePercent = params.spacePercent;
+    gScene.start.delayMode    = gDelay.mode;
+    gScene.start.tempoBPM     = params.tempoBPM;
+
+    // pick targets
+    // scale
+    int r = (int)(rand01() * 3.0f); if (r < 0) r = 0; if (r > 2) r = 2;
+    gScene.target.scale = (r == 0) ? SCALE_A_MINOR : (r == 1) ? SCALE_D_DORIAN : SCALE_C_LYDIAN;
+    // tri mix 0.15..0.65
+    gScene.target.triMix = 0.15f + 0.50f * rand01();
+    // LPF cutoff 400..8000 (log)
+    gScene.target.lpfCutHz = 400.0f * powf(20.0f, rand01());
+    // space 10..70
+    gScene.target.spacePercent = 10 + (int)(60.0f * rand01() + 0.5f);
+    // delay mode
+    gScene.target.delayMode = (rand01() < 0.5f) ? DELAY_1_8 : DELAY_1_4;
+    // tempo ±5%
+    float f = 0.95f + 0.10f * rand01();
+    int tBpm = (int)(params.tempoBPM * f + 0.5f);
+    if (tBpm < 30) tBpm = 30; if (tBpm > 240) tBpm = 240;
+    gScene.target.tempoBPM = tBpm;
+
+    // crossfade 10–20 s
+    float durSec = 10.0f + 10.0f * rand01();
+    uint64_t durSmp = (uint64_t)(durSec * SR + 0.5f);
+    gScene.tStartSmp = nowSmp;
+    gScene.tEndSmp   = nowSmp + (durSmp ? durSmp : 1);
+    gScene.active    = true;
+
+    // show UI hint once at start
+    tft.setTextSize(2);
+    const char* msg = "Scene...fading";
+    int16_t x1,y1; uint16_t w,h;
+    tft.getTextBounds(msg, 0, 0, &x1, &y1, &w, &h);
+    int x = (tft.width() - (int)w)/2, y = 4; // top banner
+    tft.fillRect(0, 0, tft.width(), h + 10, ST77XX_BLACK);
+    tft.setCursor(x, y);
+    tft.print(msg);
+
+    // schedule next automatic scene
+    gSceneSch.nextSceneAt = nowSmp + gSceneSch.minIntvSmp +
+                            (uint32_t)((gSceneSch.maxIntvSmp - gSceneSch.minIntvSmp) * rand01());
+  }
+
+  // If active, apply crossfade ramps
+  if (gScene.active){
+    float t = 0.0f;
+    if (gScene.tEndSmp > gScene.tStartSmp){
+      uint64_t num = (nowSmp > gScene.tEndSmp) ? (gScene.tEndSmp - gScene.tStartSmp)
+                                               : (nowSmp - gScene.tStartSmp);
+      uint64_t den = (gScene.tEndSmp - gScene.tStartSmp);
+      t = (float)num / (float)den;
+    }
+    float e = smooth(t);
+
+    // triMix (linear, safe range)
+    float tri = lerp(gScene.start.triMix, gScene.target.triMix, e);
+    pad.triMix = tri; pad.v1.triMix = tri; pad.v2.triMix = tri; pad.v3.triMix = tri;
+
+    // LPF cutoff (log interpolation)
+    float cut = expLerp(gScene.start.lpfCutHz, gScene.target.lpfCutHz, e);
+    pad.lpfCutHz = cut; lp_set(pad.lp, pad.lpfCutHz, SR);
+
+    // Space / FX mix (int lerp)
+    int spc = (int)(lerp((float)gScene.start.spacePercent, (float)gScene.target.spacePercent, e) + 0.5f);
+    if (spc < 0) spc = 0; if (spc > 100) spc = 100;
+    if (spc != params.spacePercent){ params.spacePercent = spc; delay_set_space(gDelay, params.spacePercent); }
+
+    // Tempo glide (small steps; rest of system tracks)
+    int bpm = (int)(lerp((float)gScene.start.tempoBPM, (float)gScene.target.tempoBPM, e) + 0.5f);
+    if (bpm < 30) bpm = 30; if (bpm > 240) bpm = 240;
+    if (bpm != params.tempoBPM) params.tempoBPM = bpm;
+
+    // Scale: switch early in fade so new notes follow target
+    if (e >= 0.2f) gScene.start.scale = gScene.target.scale, gScale = gScene.target.scale;
+
+    // DelayMode: switch near end to avoid combing
+    if (e >= 0.8f && gDelay.mode != gScene.target.delayMode){
+      delay_set_mode(gDelay, gScene.target.delayMode);
+    }
+
+    // End of fade
+    if (t >= 1.0f){
+      gScene.active = false;
+      // clear banner area
+      tft.fillRect(0, 0, tft.width(), 18, ST77XX_BLACK);
+    }
+  }
+}
+
+// --- [NEW] Gesture update & apply (call once per block, AFTER scene_update) ---
+inline void gesture_update_and_apply(uint64_t nowSmp){
+  // keep lambda tied to current Energy mapping
+  gGesture.lambdaHz = (gEnergy.gestureLambdaHz > 0.0f) ? gEnergy.gestureLambdaHz : (1.0f/15.0f);
+
+  // seed next event if needed
+  if (gGesture.nextAt == 0){
+    gGesture.nextAt = nowSmp + samplesFromExp(gGesture.lambdaHz);
+  }
+
+  // start new gesture if due
+  if (!gGesture.active && nowSmp >= gGesture.nextAt){
+    float atk = 0.5f + 1.0f * rand01();      // 0.5..1.5 s
+    float rel = 2.5f + 2.0f * rand01();      // 2.5..4.5 s
+    uint64_t aS = (uint64_t)(atk * SR + 0.5f);
+    uint64_t rS = (uint64_t)(rel * SR + 0.5f);
+
+    gGesture.tStart    = nowSmp;
+    gGesture.tAtkEnd   = gGesture.tStart + (aS ? aS : 1);
+    gGesture.tRelStart = gGesture.tAtkEnd;
+    gGesture.tEnd      = gGesture.tRelStart + (rS ? rS : 1);
+    gGesture.env       = 0.0f;
+    gGesture.active    = true;
+
+    gGesture.cutBoostOct = 0.25f + 0.55f * rand01();  // 0.25..0.80
+    gGesture.fxSendBoost = 0.30f + 0.40f * rand01();  // 0.30..0.70
+    gGesture.fxWetBoost  = 0.20f + 0.30f * rand01();  // 0.20..0.50
+
+    // schedule next
+    gGesture.nextAt = nowSmp + samplesFromExp(gGesture.lambdaHz);
+  }
+
+  // raw env u(t)
+  float u = 0.0f;
+  if (gGesture.active){
+    if (nowSmp < gGesture.tAtkEnd){
+      uint64_t num = nowSmp - gGesture.tStart;
+      uint64_t den = gGesture.tAtkEnd - gGesture.tStart;
+      u = (den ? (float)num/(float)den : 1.0f);
+    } else if (nowSmp < gGesture.tEnd){
+      uint64_t num = nowSmp - gGesture.tRelStart;
+      uint64_t den = gGesture.tEnd - gGesture.tRelStart;
+      float d = (den ? (float)num/(float)den : 1.0f);
+      u = 1.0f - d;
+    } else {
+      gGesture.active = false;
+      gGesture.env = 0.0f;
+    }
+  }
+
+ 
+
+  // smooth env (~50ms time constant at block-rate)
+  const float alpha = 1.0f - expf(-(float)CHUNK / (SR * 0.05f));
+  gGesture.env += alpha * (u - gGesture.env);
+  float e = gGesture.env;
+
+  // apply overlay (only while active or if smoothing tail > 0)
+  if (e > 0.0005f){
+    // Pad brighten: multiplicative in octaves
+    float effCut = pad.lpfCutHz * powf(2.0f, gGesture.cutBoostOct * e);
+    if (effCut > 8000.0f) effCut = 8000.0f;
+    if (effCut < 400.0f)  effCut = 400.0f;
+    lp_set(pad.lp, effCut, SR);  // retune 1-pole cutoff
+
+    // FX sends/wets scaled from bases (non-destructive)
+    gDelay.send  = gDelay.baseSend  * (1.0f + gGesture.fxSendBoost * e);
+    gDelay.wet   = gDelay.baseWet   * (1.0f + gGesture.fxWetBoost  * e);
+    gReverb.send = gReverb.baseSend * (1.0f + gGesture.fxSendBoost * e);
+    gReverb.wet  = gReverb.baseWet  * (1.0f + gGesture.fxWetBoost  * e);
+  } else {
+    // restore to bases when env ~ 0
+    gDelay.send  = gDelay.baseSend;   gDelay.wet  = gDelay.baseWet;
+    gReverb.send = gReverb.baseSend;  gReverb.wet = gReverb.baseWet;
+  }
+}
+
+static inline void panGains(float pan, float &gL, float &gR){
+  // Equal-power (−3 dB) law, θ = 0.25π*(pan+1); 0.25π ≈ 0.78539816339
+  float th = 0.78539816339f * (pan + 1.0f);
+  gL = cosf(th);
+  gR = sinf(th);
+}
+static inline void applyWidth(float &L,float &R,float width){
+  if(width<0.2f) width=0.2f; if(width>1.2f) width=1.2f;
+  float M=0.5f*(L+R), S=0.5f*(L-R)*width; L=M+S; R=M-S;
+}
+
 // --- Apply encoder rotation to active page ---
 void applyEncoderDelta(int steps){
   if (steps == 0) return;
@@ -879,9 +1142,14 @@ void applyEncoderDelta(int steps){
   } else if (currentPage == PAGE_TONE) {
     params.tonePercent = constrain(params.tonePercent + delta, 0, 100);
     tone_set(gTilt, params.tonePercent);
-  } else { // PAGE_ENERGY
+  } else if (currentPage == PAGE_ENERGY) { // PAGE_ENERGY
     params.energyPercent = constrain(params.energyPercent + delta, 0, 100);
     energy_set(gEnergy, pad, params.energyPercent);
+  } else if (currentPage == PAGE_SCENE){
+    (void)delta;                       // any turn triggers immediately
+    gSceneSch.nextSceneAt = gClock.smpNow;  // due now
+    scene_update(gClock.smpNow);            // kick off crossfade ("Scene...fading" banner)
+    return;
   }
 }
 
@@ -942,6 +1210,8 @@ void i2sInit() {
 
 // -------- Setup --------
 void setup() {
+  // randomize seed 
+  gRng32 ^= esp_random() ^ ((uint32_t)millis() << 1);
   // Encoder pins
   pinMode(ENC_A, INPUT_PULLUP);
   pinMode(ENC_B, INPUT_PULLUP);
@@ -1011,28 +1281,76 @@ void loop() {
   clock_update_tempo_if_changed(gClock, params.tempoBPM);
   delay_update_tempo_if_changed(gDelay, params.tempoBPM);
 
+
   // mixer blaah
+  float tSpace = constrain(params.spacePercent, 0, 100) * 0.01f;
+  float width  = 0.35f + (1.10f - 0.35f) * sqrtf(tSpace);  // 0.35..1.10
+  const float CTR = 0.70710678f;  // -3 dB center
   for (int i = 0; i < CHUNK; ++i) {
-    float dry0 = /*pad_step(pad, SR) +*/ pluck_step(gPluck, SR);
-    float dry  = tone_process(gTilt, dry0);      // <— tilt EQ
+    // Pad (mono, centered with -3 dB law)
+    float padMono = 0;//pad_step(pad, SR);
 
-    float wetTap = delay_step(gDelay, dry);
-    float wetRev = reverb_step(gReverb, dry);
+    // Plucks: per-voice pan
+    float plL = 0.0f, plR = 0.0f, plMono = 0.0f;
+    for (int vi = 0; vi < 4; ++vi){
+      PluckVoice &v = gPluck.v[vi];
+      if (!v.active) continue;
 
-    float s = dry + gDelay.wet * wetTap + gReverb.wet * wetRev;
+      // Mild random pan when a note starts (first attack)
+      if (v.eg.st == ENV_ATTACK && v.eg.env == 0.0f) {
+        if (v.pan == 0.0f) v.pan = (rand01()*2.0f - 1.0f) * 0.35f; // ±0.35
+      }
 
-    float x = s * volSmooth * fade * MASTER_GAIN;
-    x = dc.process(x);
-    x = softClip(x);
+      float env = adsr_step(v.eg, SR);
+      if (v.eg.st == ENV_IDLE){ v.active = false; continue; }
 
-    int16_t v = (int16_t)floorf(x * 32767.0f);
+      v.phase += TAU * (v.freqHz / SR);
+      if (v.phase >= TAU) v.phase -= TAU;
+      float sSin = sinf(v.phase);
+      float duty = 0.30f;  
+      float sSq = (fmodf(v.phase / TAU, 1.0f) < duty) ? 1.0f : -1.0f;
+      float sMix = 0.80f * sSin + 0.20f * sSq;
+
+      float sV   = sMix * env * v.vel;
+
+      plMono += sV;
+      float gL, gR; panGains(v.pan, gL, gR);   // helper defined once at top
+      plL += sV * gL * gPluck.gain;
+      plR += sV * gR * gPluck.gain;
+    }
+
+    // Build dry L/R
+    float L = padMono * CTR + plL;
+    float R = padMono * CTR + plR;
+
+    // Mono dry bus for FX with tilt
+    float dryFX  = tone_process(gTilt, padMono + plMono);
+    float wetTap = delay_step(gDelay,  dryFX);
+    float wetRev = reverb_step(gReverb, dryFX);
+    float wetSum = gDelay.wet * wetTap + gReverb.wet * wetRev;
+
+    // Center the FX returns
+    L += wetSum * CTR;
+    R += wetSum * CTR;
+
+    // Master width (mid/side)
+    applyWidth(L, R, width);                 // helper defined once at top
+
+    // Master gain, per-channel DC block and clip
+    float xL = L * volSmooth * fade * MASTER_GAIN;
+    float xR = R * volSmooth * fade * MASTER_GAIN;
+    xL = dcL.process(xL); xR = dcR.process(xR);  // per-channel DC (NOT mono dc)
+    xL = softClip(xL);    xR = softClip(xR);
+
     int j = i * 2;
-    buf[j + 0] = v;  // L
-    buf[j + 1] = v;  // R
+    buf[j + 0] = (int16_t)floorf(xL * 32767.0f);  // Left
+    buf[j + 1] = (int16_t)floorf(xR * 32767.0f);  // Right
   }
 
   size_t written = 0;
   i2s_write(I2S_NUM_0, (const char*)buf, sizeof(buf), &written, portMAX_DELAY);
   clock_advance_block(gClock, (uint32_t)CHUNK);
   maybeTriggerGesture(gEnergy, gClock.smpNow);
+  scene_update(gClock.smpNow);   // <— schedule & apply crossfade
+  gesture_update_and_apply(gClock.smpNow);  // <— overlay pad brightness & FX sends
 }
