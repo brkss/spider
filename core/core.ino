@@ -39,7 +39,7 @@
 static const float MASTER_GAIN = 1.35f;  // ~+2.6 dB headroom into soft clip
 
 enum DelayMode : uint8_t { DELAY_1_8 = 0, DELAY_1_4 };
-enum Scale : uint8_t { SCALE_A_MINOR = 0, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
+enum Scale : uint8_t { SCALE_C_MINOR = 0, SCALE_A_MINOR, SCALE_D_DORIAN, SCALE_C_LYDIAN, SCALE_COUNT };
 enum Page { PAGE_VOLUME = 0, PAGE_TEMPO, PAGE_SPACE, PAGE_MOOD, PAGE_TONE, PAGE_ENERGY, PAGE_SCENE, PAGE_COUNT };
 
 
@@ -262,6 +262,7 @@ struct ScaleDef {
 };
 
 static const ScaleDef SCALES[(int)SCALE_COUNT] = {
+  /* C minor           */ { 0, {0,2,4,6,7,9,11}, 7 },
   /* A minor (Aeolian) */ { 9, {0,2,3,5,7,8,10}, 7 },
   /* D dorian          */ { 2, {0,2,3,5,7,9,10}, 7 },
   /* C lydian          */ { 0, {0,2,4,6,7,9,11}, 7 }
@@ -423,16 +424,28 @@ inline void clock_update_tempo_if_changed(Clock16& c, int bpm){
 
 // Called on every 1/16 step (no audible click; default no-op)
 inline void onStep16(uint16_t step){
-   if (!gPluck.inited) pluck_init(gPluck);
+  if (!gPluck.inited) pluck_init(gPluck);
+  // vary probabilities every bar (16 steps)
+  static uint16_t lastBar = 0;
+  uint16_t bar = step / 16;
+  static float wob = 1.0f;
+  if (bar != lastBar) {
+    lastBar = bar;
+    // wobble 0.9..1.1
+    wob = 0.9f + 0.2f * rand01();
+  }
 
-  float p = ((step & 3u) == 0u) ? gEnergy.pStrong
-           : ((step & 1u) == 0u) ? gEnergy.pEven
-           : gEnergy.pOdd;
+
+  float p = ((step & 3u) == 0u) ? gEnergy.pStrong * wob
+         : ((step & 1u) == 0u) ? gEnergy.pEven   * wob
+         :                       gEnergy.pOdd    * wob;
+
+  p = constrain(p, 0.02f, 0.95f);
 
   if (rand01() < p){
     int center = 60; // C4 center
     int note = pickAmbientNote(gScale, center);
-    float vel = 0.55f + 0.35f * rand01();
+    float vel = 0.45f + 0.50f * rand01();
     pluck_noteOn(gPluck, note, vel);
   }
 }
@@ -471,56 +484,45 @@ inline int quantizeMidi(int midi, Scale s) {
   return out;
 }
 
+// Replace your existing pickAmbientNote with this version
 inline int pickAmbientNote(Scale s, int centerMidi) {
-  const ScaleDef& sd = scaleDef(s);
-  auto pc12 = [](int m){ int x = m % 12; return (x < 0) ? x + 12 : x; };
-
-  int base = quantizeMidi(centerMidi, s);
-
-  // Small diatonic step pattern (center-biased, deterministic cycle)
-  static const int OFFS[] = { 0, 1, -1, 2, -2, 3, -3, 4, -4, 1, 0, -1 };
-  static uint8_t idx = 0;
-  int steps = OFFS[idx++ % (sizeof(OFFS)/sizeof(OFFS[0]))];
-
-  auto nextUpDelta = [&](int currentPC)->int {
-    int best = 12; // minimal positive semitones to next allowed PC
-    for (int i = 0; i < sd.count; ++i) {
-      int pc = (sd.rootPC + sd.degrees[i]) % 12;
-      int d = (pc - currentPC + 12) % 12;
-      if (d == 0) d = 12;       // same PC => go to next octave
-      if (d < best) best = d;
-    }
-    return best; // 1..12
-  };
-  auto prevDownDelta = [&](int currentPC)->int {
-    int best = 12; // minimal positive semitones to previous allowed PC
-    for (int i = 0; i < sd.count; ++i) {
-      int pc = (sd.rootPC + sd.degrees[i]) % 12;
-      int d = (currentPC - pc + 12) % 12;
-      if (d == 0) d = 12;       // same PC => go to previous octave
-      if (d < best) best = d;
-    }
-    return best; // 1..12 (to step downward)
-  };
-
-  int out = base;
-  if (steps > 0) {
-    for (int k = 0; k < steps; ++k) {
-      int curPC = pc12(out);
-      out += nextUpDelta(curPC);
-    }
-  } else if (steps < 0) {
-    for (int k = 0; k < -steps; ++k) {
-      int curPC = pc12(out);
-      out -= prevDownDelta(curPC);
-    }
+  // Initialize the walking note around the provided center, quantized to scale
+  static bool init = false;
+  static int  curMidi = 60;  // persistent between calls
+  if (!init) {
+    curMidi = quantizeMidi(centerMidi, s);
+    // keep in a practical musical range
+    if (curMidi < 36) curMidi = 36;   // C2
+    if (curMidi > 96) curMidi = 96;   // C7
+    init = true;
   }
 
-  // Optional gentle clamp to a practical range (leave plenty of room)
-  if (out < 24) out = 24;      // C1
-  if (out > 108) out = 108;    // C8-
+  // --- Small, musical random walk (center-biased) ---
+  // More zeros/±1 for smoother motion; occasional larger steps
+  static const int STEPS[9] = { -3, -2, -1, 0, 0, 0, +1, +2, +3 };
+  int step = STEPS[rng32() % 9];
 
-  return out;
+  // Occasional octave hop to break repetition (~12% chance)
+  if (rand01() < 0.12f) {
+    step += (rand01() < 0.5f ? +2 : -2);
+  }
+
+  // Move, then quantize to the current scale (keeps it diatonic)
+  curMidi = quantizeMidi(curMidi + step, s);
+
+  // Softly pull back toward the requested center over time (prevents drift)
+  // ~10% chance per call to nudge 1 semitone toward the current center
+  if (rand01() < 0.10f) {
+    int target = quantizeMidi(centerMidi, s);
+    if (curMidi < target)      curMidi = quantizeMidi(curMidi + 1, s);
+    else if (curMidi > target) curMidi = quantizeMidi(curMidi - 1, s);
+  }
+
+  // Clamp to a practical performance range
+  if (curMidi < 36) curMidi = 36;   // C2
+  if (curMidi > 96) curMidi = 96;   // C7
+
+  return curMidi;
 }
 
 // --- [NEW] Pluck helpers: RNG, ADSR, noteOn, render ---
@@ -1288,7 +1290,7 @@ void loop() {
   const float CTR = 0.70710678f;  // -3 dB center
   for (int i = 0; i < CHUNK; ++i) {
     // Pad (mono, centered with -3 dB law)
-    float padMono = 0;//pad_step(pad, SR);
+    float padMono = pad_step(pad, SR);
 
     // Plucks: per-voice pan
     float plL = 0.0f, plR = 0.0f, plMono = 0.0f;
