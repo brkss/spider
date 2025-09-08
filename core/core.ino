@@ -71,16 +71,16 @@ struct OnePoleLP {
 // Gentle pad: 3 detuned osc → amp-LFO → LPF
 struct Pad {
   Osc v1, v2, v3;
-  float baseHz = 180.0f;
+  float baseHz = 140.0f;
   float det = 0.0f;        // ±1.2%
-  float triMix = 0.18f;      // sine/triangle blend
+  float triMix = 0.0f;      // sine/triangle blend
   // Amp LFO
   float ampLfoPhase = 0.0f;
   float ampLfoRateHz = 0.05f;
   float ampLfoDepth = 0.18f; // 0..1
   // LPF
   OnePoleLP lp;
-  float lpfCutHz = 1200.0f;
+  float lpfCutHz = 800.0f;
   bool inited = false;
 };
 
@@ -631,7 +631,7 @@ inline float pluck_step(PluckPool& p, float sr){
 
 inline void pad_init(Pad& p, float sr) {
   p.v1.freqHz = p.baseHz;
-  p.v2.freqHz = p.baseHz * (1.0f + p.det);
+  p.v2.freqHz = p.baseHz * (1.0f - p.det);
   p.v3.freqHz = p.baseHz * (1.0f - p.det);
   p.v1.triMix = p.v2.triMix = p.v3.triMix = p.triMix;
   lp_set(p.lp, p.lpfCutHz, sr);
@@ -658,7 +658,7 @@ inline float pad_step(Pad& p, float sr) {
 
   // gentle LPF
   s = lp_process(p.lp, s);
-  return s;
+  return s * 0.8f;
 }
 
 // --- [NEW] Tone EQ (tilt around ~6 kHz) ---
@@ -1366,7 +1366,7 @@ void loop() {
   // apply smoothed base pitch to pad oscillators
   pad.baseHz = pitchSmoothHz;
   pad.v1.freqHz = pad.baseHz;
-  pad.v2.freqHz = pad.baseHz * (1.0f + pad.det);
+  pad.v2.freqHz = pad.baseHz * (1.0f - pad.det);
   pad.v3.freqHz = pad.baseHz * (1.0f - pad.det);
   for (int i = 0; i < CHUNK; ++i) {
     // --- Pad (mono)
@@ -1400,7 +1400,7 @@ void loop() {
     float noiseFx  = n * NOISE_FX_GAIN;
 
     // --- Build mono dry
-    float dryMono = padMono * CTR + plMono + noiseDry;
+    float dryMono = padMono * CTR * 0.3 + plMono + noiseDry;
 
     // --- FX bus (mono) with tone tilt
     float dryFX  = tone_process(gTilt, dryMono + noiseFx);
