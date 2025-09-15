@@ -71,7 +71,7 @@ struct OnePoleLP {
 // Gentle pad: 3 detuned osc → amp-LFO → LPF
 struct Pad {
   Osc v1, v2, v3;
-  float baseHz = 180.0f;
+  float baseHz = 220.0f;
   float det = 0.0035f;        // ±1.2%
   float triMix = 0.0f;      // sine/triangle blend
   // Amp LFO
