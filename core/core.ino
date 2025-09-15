@@ -35,6 +35,32 @@
 //#define ST7735_TAB INITR_GREENTAB
 //#define ST7735_TAB INITR_REDTAB
 
+// -------- Arpeggiator burst (capture last notes, play fast, then restore) --------
+#define ARP_PERIOD_MIN_SEC   30   // MIN period in seconds before starting ARP 
+#define ARP_PERIOD_MAX_SEC   120  // MAX period in seconds before starting ARP 
+#define ARP_PLAY_MIN_SEC     6   // MIN ARP PLAY IN SECONDS 
+#define ARP_PLAY_MAX_SEC     14   // MAX ARP PLAY IN SECONDS 
+#define ARP_HISTORY_MAX      64
+#define ARP_CAPTURE_COUNT    16
+#define ARP_FAST_BPM         99
+
+struct NoteEvent { int midi; float vel; };
+static NoteEvent gNoteHist[ARP_HISTORY_MAX];
+static uint16_t  gNoteWr = 0, gNoteCount = 0;
+static volatile bool gArpInjecting = false;   // don't log notes we generate in arp
+
+struct ArpCtrl {
+  bool      active = false;
+  uint64_t  tEndSmp = 0;
+  uint64_t  nextAtSmp = 0;   // next time to auto-start
+  int       restoreBPM = 104;
+  int       seq[ARP_CAPTURE_COUNT];
+  float     vel[ARP_CAPTURE_COUNT];
+  int       len = 0;
+  int       idx = 0;
+};
+static ArpCtrl gArp;
+
 
 
 // --- [NEW] Master makeup gain to boost overall loudness ---
@@ -296,6 +322,8 @@ inline const ScaleDef& scaleDef(Scale s) { return SCALES[(int)s]; }
 
 
 
+
+
 // -------- Audio constants --------
 static const int   SR   = 44100;
 static const float TAU  = 6.28318530718f;
@@ -356,6 +384,77 @@ void nextPage(){
   currentPage = (Page)((currentPage + 1) % PAGE_COUNT);
   lastPageShown = -1; // force UI refresh
   lastValShown  = -1;
+}
+
+
+// ARP Handlers 
+
+static inline float randRange(float a, float b){ return a + (b - a) * rand01(); }
+
+static inline uint64_t randArpPeriodSmp(){
+  float sec = randRange(ARP_PERIOD_MIN_SEC, ARP_PERIOD_MAX_SEC);
+  return (uint64_t)(sec * SR + 0.5f);
+}
+static inline uint64_t randArpPlaySmp(){
+  float sec = randRange(ARP_PLAY_MIN_SEC, ARP_PLAY_MAX_SEC);
+  return (uint64_t)(sec * SR + 0.5f);
+}
+
+// push into history (most recent first reads back easily)
+static inline void notehist_push(int midi, float vel){
+  if (gArpInjecting) return;                 // ignore arp-generated notes
+  gNoteHist[gNoteWr] = { midi, vel };
+  gNoteWr = (gNoteWr + 1) % ARP_HISTORY_MAX;
+  if (gNoteCount < ARP_HISTORY_MAX) gNoteCount++;
+}
+
+// gather last K notes into the arp sequence
+static inline int arp_capture_last(ArpCtrl& a, int k){
+  if (k > ARP_CAPTURE_COUNT) k = ARP_CAPTURE_COUNT;
+  int have = (gNoteCount < k) ? gNoteCount : k;
+  if (have <= 0) return 0;
+  // read back from newest to older and reverse to preserve musical order
+  for (int i = 0; i < have; ++i){
+    int idx = (int)gNoteWr - 1 - i;
+    while (idx < 0) idx += ARP_HISTORY_MAX;
+    a.seq[have - 1 - i] = gNoteHist[idx].midi;
+    a.vel[have - 1 - i] = gNoteHist[idx].vel;
+  }
+  return have;
+}
+
+
+
+// start/stop + update
+static inline void arp_start(ArpCtrl& a, uint64_t nowSmp){
+  a.len = arp_capture_last(a, ARP_CAPTURE_COUNT);
+  if (a.len <= 0){                           // nothing to do; schedule next time
+    a.active   = false;
+    a.nextAtSmp = nowSmp + randArpPeriodSmp();
+    return;
+  }
+  a.idx = 0;
+  a.restoreBPM = params.tempoBPM;
+  params.tempoBPM = ARP_FAST_BPM;            // "fast tempo"
+  a.tEndSmp  = nowSmp + randArpPeriodSmp();
+  a.active   = true;
+}
+
+static inline void arp_stop(ArpCtrl& a){
+  a.active = false;
+  params.tempoBPM = a.restoreBPM;            // restore original tempo
+}
+
+// call from onStep16() while active to emit the next note
+static inline void arp_step16_fire(ArpCtrl& a){
+  if (!a.active || a.len <= 0) return;
+  int m = a.seq[a.idx];
+  float v = a.vel[a.idx];
+  a.idx = (a.idx + 1) % a.len;
+
+  gArpInjecting = true;
+  pluck_noteOn(gPluck, m, v);
+  gArpInjecting = false;
 }
 
 // --- [NEW] Helpers: clamping & page cycling ---
@@ -449,6 +548,14 @@ inline void clock_update_tempo_if_changed(Clock16& c, int bpm){
 // Called on every 1/16 step (no audible click; default no-op)
 inline void onStep16(uint16_t step){
   if (!gPluck.inited) pluck_init(gPluck);
+
+  // --- If ARP burst is active, fire one step and skip normal probabilistic triggers
+  if (gArp.active){
+    arp_step16_fire(gArp);
+    return;
+  }
+  // --- otherwise fall through to normal behavior
+
   // vary probabilities every bar (16 steps)
   static uint16_t lastBar = 0;
   uint16_t bar = step / 16;
@@ -458,6 +565,8 @@ inline void onStep16(uint16_t step){
     // wobble 0.9..1.1
     wob = 0.9f + 0.2f * rand01();
   }
+
+  
 
 
   float p = ((step & 3u) == 0u) ? gEnergy.pStrong * wob
@@ -610,6 +719,8 @@ inline void pluck_noteOn(PluckPool& p, int midi, float vel){
   v.eg.st  = ENV_ATTACK;
   v.eg.gate= false;          // pluck: short gate
   v.active = true;
+
+  notehist_push(v.midi, v.vel);
 }
 
 inline float pluck_step(PluckPool& p, float sr){
@@ -1322,6 +1433,12 @@ void setup() {
   // noise 
   pink_init(gPink);
 
+  // ARP
+  // Arp: schedule first burst
+  // Arp: schedule first burst
+  gArp.active = false;
+  gArp.nextAtSmp = gClock.smpNow + randArpPeriodSmp();
+
   // I2S
   i2sInit();
 }
@@ -1371,6 +1488,8 @@ void loop() {
     // schedule next change in 3–7 seconds
     nextPitchChange = now + 3000 + (uint32_t)(rand01() * 4000.0f);
   }
+
+  
 
   // smooth toward target (≈15s time constant)
   const float alphaPitch = 1.0f - expf(-(float)CHUNK / (SR * 15.0f));
@@ -1439,7 +1558,20 @@ void loop() {
 
   size_t written = 0;
   i2s_write(I2S_NUM_0, (const char*)buf, sizeof(buf), &written, portMAX_DELAY);
+  
   clock_advance_block(gClock, (uint32_t)CHUNK);
+  // --- Arp scheduler: start/stop, based on sample clock
+  if (!gArp.active){
+    if (gClock.smpNow >= gArp.nextAtSmp){
+      arp_start(gArp, gClock.smpNow);
+      // next burst is scheduled when starting (if capture fails) or when this one ends
+    }
+  } else {
+    if (gClock.smpNow >= gArp.tEndSmp){
+      arp_stop(gArp);
+      gArp.nextAtSmp = gClock.smpNow + randArpPeriodSmp();
+    }
+  }
   maybeTriggerGesture(gEnergy, gClock.smpNow);
   scene_update(gClock.smpNow);
   gesture_update_and_apply(gClock.smpNow);
