@@ -72,16 +72,20 @@ struct OnePoleLP {
 struct Pad {
   Osc v1, v2, v3;
   float baseHz = 180.0f;
-  float det = 0.0f;        // ±1.2%
-  float triMix = 0.18f;      // sine/triangle blend
+  float det = 0.0035f;        // ±1.2%
+  float triMix = 0.0f;      // sine/triangle blend
   // Amp LFO
   float ampLfoPhase = 0.0f;
   float ampLfoRateHz = 0.05f;
   float ampLfoDepth = 0.18f; // 0..1
   // LPF
   OnePoleLP lp;
-  float lpfCutHz = 1200.0f;
+  float lpfCutHz = 1800.0f;
   bool inited = false;
+  // Vibrato 
+  float vibLfoPhase = 0.0f;
+  float vibLfoRateHz = 0.14f;   // 0.10..0.20 Hz
+  float vibDepthCents = 7.0f;   // subtle: ~±3.5 cents
 };
 
 // --- [NEW] Musical clock types/state (place with other structs/globals) ---
@@ -104,7 +108,7 @@ struct PinkNoise {
 };
 static PinkNoise gPink;
 static const float NOISE_DRY_GAIN = 0.0f;   // keep 0.0 for FX-only
-static const float NOISE_FX_GAIN  = 0.12f;  // try 0.08–0.20
+static const float NOISE_FX_GAIN  = 0.22f;  // try 0.08–0.20
 
 
 
@@ -644,12 +648,26 @@ inline float pad_step(Pad& p, float sr) {
   // slow amp LFO
   p.ampLfoPhase += TAU * (p.ampLfoRateHz / sr);
   if (p.ampLfoPhase >= TAU) p.ampLfoPhase -= TAU;
+  float vib = sinf(p.vibLfoPhase); // -1..1
+  float vibRatio = powf(2.0f, (p.vibDepthCents * vib) / 1200.0f);
+
   float lfo = 0.5f + 0.5f * sinf(p.ampLfoPhase);                 // 0..1
   float amp = (1.0f - p.ampLfoDepth) + p.ampLfoDepth * lfo;      // 1-depth .. 1
+
+  // modulate instantaneous osc freqs very slightly
+  float f1 = p.v1.freqHz * vibRatio;
+  float f2 = p.v2.freqHz * vibRatio;
+  float f3 = p.v3.freqHz * vibRatio;
+
+  // call osc with temp freqs
+  float old1=p.v1.freqHz, old2=p.v2.freqHz, old3=p.v3.freqHz;
+  p.v1.freqHz=f1; p.v2.freqHz=f2; p.v3.freqHz=f3;
 
   // 3-voice detuned pad
   float s = (osc_sine_tri(p.v1, sr) + osc_sine_tri(p.v2, sr) + osc_sine_tri(p.v3, sr)) * (1.0f / 3.0f);
   s *= amp;
+
+  p.v1.freqHz=old1; p.v2.freqHz=old2; p.v3.freqHz=old3;
 
   // pre-filter soft saturation (tames spiky highs without harshness)
   s = tanhf(0.6f * s);
@@ -739,26 +757,22 @@ inline void maybeTriggerGesture(EnergyCtrl& e, uint64_t smpNow){
 }
 
 // MOOD 
+// PATCH:  mood_set()darker, smoother ranges
 inline void mood_set(Pad& pad, ReverbLite& rv, int moodPct){
-  if (moodPct < 0) moodPct = 0; if (moodPct > 100) moodPct = 100;
-  float k = moodPct * (1.0f/100.0f);   // 0..1
+  moodPct = constrain(moodPct, 0, 100);
+  float k = moodPct * 0.01f;
 
-  // LPF cutoff: log map 400 → 8000 Hz
-  // darker & smoother: 300 → ~5 kHz max
-  float cut= 300.0f * powf(16.0f, k); // caps ~4800 Hz
-  pad.triMix = 0.08f + 0.37f * k;      // 0.08..0.45 (stays mostly sine)
-  lp_set(pad.lp, pad.lpfCutHz, SR);
- 
-  // Osc shape: sine→triangle blend (gentle range)
-  pad.triMix = 0.10f + 0.60f * k;      // 0.10 .. 0.70
+  // LPF: ~500 → ~3500 Hz (log), cap highs to keep the haze gentle
+  float cut = 500.0f * powf(7.0f, k);           // ~500..3500
+  pad.lpfCutHz = cut; lp_set(pad.lp, pad.lpfCutHz, SR);
+
+  // Osc shape: mostly sine; never > ~0.28 triangle to avoid buzz
+  pad.triMix = 0.06f + 0.22f * k;               // 0.06..0.28
   pad.v1.triMix = pad.v2.triMix = pad.v3.triMix = pad.triMix;
 
-  // Reverb damping: darker (more damp) at low mood → airier at high mood
-  float moodDamp = 0.35f - 0.20f * k;  // 0.35 .. 0.15
-  // Combine with current Space-based damp (average to avoid jumps)
-  for (int i=0;i<4;i++){
-    rv.c[i].damp = 0.5f * rv.c[i].damp + 0.5f * moodDamp;
-  }
+  // Reverb damping stays fairly dark, slightly airier with mood
+  float moodDamp = 0.28f - 0.10f * k;           // 0.28..0.18
+  for (int i=0;i<4;i++) rv.c[i].damp = 0.5f * rv.c[i].damp + 0.5f * moodDamp;
 }
 
 // REVERB 
@@ -802,18 +816,17 @@ inline float allpass_step(AllpassLite& a, float x){
   return y;
 }
 
+// PATCH: in reverb_set_space() make it wetter/darker overall
 inline void reverb_set_space(ReverbLite& r, int spacePct){
-  float t = (spacePct <= 0) ? 0.0f : (spacePct >= 100 ? 1.0f : (spacePct * 0.01f));
+  float t = constrain(spacePct, 0, 100) * 0.01f;
   float k = sqrtf(t);
-  float send = 0.70f * k;
-  float wet  = 0.35f * k;
-
-  float fb = 0.45f + 0.27f * k; if (fb > 0.75f) fb = 0.75f;
-  float damp = 0.15f + 0.20f * k;
+  float send = 0.85f * k;          // more send
+  float wet  = 0.55f * k;          // more wet
+  float fb   = 0.50f + 0.22f * k;  // modest tail
+  float damp = 0.18f + 0.14f * k;  // stays on the dark side
   for (int i=0;i<4;i++){ r.c[i].fb = fb; r.c[i].damp = damp; }
-
-  r.baseSend = send; r.baseWet = wet;
-  r.send = r.baseSend; r.wet = r.baseWet;               // live = base
+  r.baseSend = r.send = send;
+  r.baseWet  = r.wet  = wet;
 }
 
 inline float reverb_step(ReverbLite& r, float dry){
@@ -1067,7 +1080,7 @@ inline void scene_update(uint64_t nowSmp){
 inline void pink_init(PinkNoise& p){
   p.b0 = p.b1 = p.b2 = 0.0f;
   lp_set(p.hpSplit, 150.0f, SR);   // remove HVAC/rumble
-  lp_set(p.lpAir,  5000.0f, SR);   // keep only airy band
+  lp_set(p.lpAir,  4200.0f, SR); 
   p.inited = true;
 }
 
@@ -1288,7 +1301,7 @@ void setup() {
   clock_init(gClock, params.tempoBPM);   // start the 1/16 clock
 
   // delay init 
-  params.spacePercent = 45;                 // more obvious by default
+  params.spacePercent = 60;                 // more obvious by default
   delay_init(gDelay, params.tempoBPM, DELAY_1_4, 2800.0f);  // darker tone, longer tap
   delay_set_space(gDelay, params.spacePercent);
 
