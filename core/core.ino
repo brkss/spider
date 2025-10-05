@@ -386,6 +386,21 @@ void nextPage(){
   lastValShown  = -1;
 }
 
+// --- UI: Boot splash (centered small "spider") ---
+static inline void tftSplash(const char* title, uint16_t ms=700) {
+  tft.fillScreen(ST77XX_BLACK);
+  tft.setTextWrap(false);
+  tft.setTextColor(ST77XX_WHITE, ST77XX_BLACK);
+  tft.setTextSize(2);                     // small font
+  int16_t x1, y1; uint16_t w, h;
+  tft.getTextBounds(title, 0, 0, &x1, &y1, &w, &h);
+  int x = (tft.width()  - (int)w) / 2;
+  int y = (tft.height() - (int)h) / 2;
+  tft.setCursor(x, y);
+  tft.print(title);
+  delay(ms);                              // brief pause, then UI continues
+}
+
 
 // ARP Handlers 
 
@@ -1405,6 +1420,11 @@ void setup() {
 
   // TFT
   tftInit();
+  tftSplash("spider.", 3500);
+  // ensure next page draw repaints everything after splash
+  lastPageShown = -1;
+  lastValShown  = -1;
+  tft.fillScreen(ST77XX_BLACK);
   tftShowVolume((int)volTarget);
 
   // musical clock init 
